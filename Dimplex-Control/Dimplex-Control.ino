@@ -49,6 +49,9 @@
 #include <atomic>
 #include <NimBLEDevice.h>
 #include "esp_gap_ble_api.h"
+#include <stdarg.h>
+#include <esp_system.h>      // esp_reset_reason()
+#include <esp_timer.h>       // esp_timer_get_time()
 
 // =====================================================================================================
 // 1. SETTINGS
@@ -111,6 +114,7 @@ static const char *TOPIC_BLE_STATE          = "dimplex/ble/state";          // O
 static const char *TOPIC_HEATER_POWER_STATE = "dimplex/heater_power/state"; // low/high (0x0048: 01 = 0.9 kW, 03 = 1.8 kW)
 static const char *TOPIC_TEMPERATURE_STATE  = "dimplex/temperature/state";  // 0x0055: byte1 = degrees, byte2 = tenths
 static const char *TOPIC_RAW_STATE          = "dimplex/raw/state";          // diagnostics: raw bytes of the interesting registers
+static const char *TOPIC_DIAG_STATE         = "dimplex/diag/state";         // JSON with restart reason, uptime, memory, signal ... (every 60 s)
 
 WiFiClient g_wifiClient;                  // owned by mqttTask
 PubSubClient g_mqttClient(g_wifiClient);  // owned by mqttTask: no other task may call it
@@ -166,6 +170,125 @@ static volatile uint32_t g_loopGapMaxUs = 0, g_webRequestMaxUs = 0, g_mqttFailCo
 static volatile uint32_t g_bleStackFree = 0, g_mqttStackFree = 0;
 static volatile bool g_mqttUp = false;
 static volatile bool g_portalOpen = false;         // the 'Dimplex-Setup' portal is open (for the LED)
+
+// NOTE for the Arduino IDE: it inserts automatic function prototypes before the FIRST function in this file. All types
+// (struct / enum) must therefore be defined above the first function, otherwise the build fails with "does not name a type".
+// Types used by the web feedback (see "feedback for pressed buttons" further down):
+enum AwaitedControl { AW_BLE, AW_EFFECT, AW_HEATER, AW_HEATER_POWER, AW_SETPOINT, AW_FLAME_LEVEL, AW_VOLUME, AW_COUNT };
+struct AwaitedValue { bool active; int target; uint32_t sinceMs; };
+
+// ---- crash diagnostics: a small log that survives a restart ----
+// The last log lines and the last step of each task are kept in RTC memory. That memory keeps its content over a crash,
+// watchdog reset or software restart (not over a power loss). After a restart the previous session's lines are shown on the
+// Debug page, at /log and in Home Assistant, so a crash can be investigated without a USB cable.
+#define LOG_RING_LINES        30
+#define LOG_RING_LINE_LENGTH  96
+#define STEP_TEXT_LENGTH      48
+#define RTC_LOG_MAGIC         0xD1A7C0DEu
+struct RtcLog {
+  uint32_t magic;                                     // RTC_LOG_MAGIC while the content is valid
+  uint32_t head, count;                               // next line to write, number of stored lines
+  uint32_t plannedRestart;                            // RTC_LOG_MAGIC when this restart was requested by us (restartDevice)
+  char plannedReason[STEP_TEXT_LENGTH];               // why we asked for it
+  char bleStep[STEP_TEXT_LENGTH], mqttStep[STEP_TEXT_LENGTH], webStep[STEP_TEXT_LENGTH];   // what each task was doing last
+  char lines[LOG_RING_LINES][LOG_RING_LINE_LENGTH];
+  uint32_t magicEnd;
+};
+static RTC_NOINIT_ATTR RtcLog g_rtcLog;
+static SemaphoreHandle_t g_logMutex = nullptr;        // protects the ring (logLine is called from several tasks)
+// What the previous session left behind (filled once at boot by startDiagnosticsSession()).
+static char g_previousLog[LOG_RING_LINES * (LOG_RING_LINE_LENGTH + 1) + 1] = "";
+static char g_previousBleStep[STEP_TEXT_LENGTH] = "", g_previousMqttStep[STEP_TEXT_LENGTH] = "", g_previousWebStep[STEP_TEXT_LENGTH] = "";
+static bool g_previousLogValid = false;
+static char g_restartReason[96] = "unknown";          // why the bridge started (shown on the Debug page and in Home Assistant)
+static uint32_t g_bootCount = 0;                      // number of starts since the last factory reset
+
+// =====================================================================================================
+// LOGGING
+// =====================================================================================================
+// Write one line to the serial terminal as "[<ms since boot> ms] [<tag>] <message>". Use this instead of
+// Serial.print* so every line has a timestamp. The line is built first and written in one piece, so lines from
+// different tasks do not get mixed up. `format` works like printf; no newline needed.
+static void logLine(const char *tag, const char *format, ...) __attribute__((format(printf, 2, 3)));
+static void logLine(const char *tag, const char *format, ...) {
+  char message[240];
+  va_list arguments; va_start(arguments, format);
+  vsnprintf(message, sizeof(message), format, arguments);
+  va_end(arguments);
+  char line[290];
+  snprintf(line, sizeof(line), "[%lu ms] [%s] %s", (unsigned long) millis(), tag, message);
+  Serial.println(line);
+  if (g_logMutex && g_rtcLog.magic == RTC_LOG_MAGIC) {                       // keep the line in the restart-proof ring
+    xSemaphoreTake(g_logMutex, portMAX_DELAY);
+    strlcpy(g_rtcLog.lines[g_rtcLog.head], line, LOG_RING_LINE_LENGTH);
+    g_rtcLog.head = (g_rtcLog.head + 1) % LOG_RING_LINES;
+    if (g_rtcLog.count < LOG_RING_LINES) g_rtcLog.count = g_rtcLog.count + 1;
+    xSemaphoreGive(g_logMutex);
+  }
+}
+
+// ---- crash diagnostics: steps, restart reason, previous session ----
+// Remember what a task is doing right now. If the bridge crashes, the last step of each task is shown after the restart.
+static inline void setBleStep(const char *text)  { strlcpy(g_rtcLog.bleStep, text, sizeof(g_rtcLog.bleStep)); }
+static inline void setMqttStep(const char *text) { strlcpy(g_rtcLog.mqttStep, text, sizeof(g_rtcLog.mqttStep)); }
+static inline void setWebStep(const char *text)  { strlcpy(g_rtcLog.webStep, text, sizeof(g_rtcLog.webStep)); }
+
+// Write the lines of a ring as text, oldest first, one per line. Returns the text length.
+static size_t joinRingLines(const RtcLog &log, char *out, size_t outSize) {
+  size_t length = 0;
+  out[0] = 0;
+  for (uint32_t i = 0; i < log.count; i++) {
+    uint32_t index = (log.head + LOG_RING_LINES - log.count + i) % LOG_RING_LINES;
+    size_t lineLength = strnlen(log.lines[index], LOG_RING_LINE_LENGTH);
+    if (length + lineLength + 2 > outSize) break;
+    memcpy(out + length, log.lines[index], lineLength); length += lineLength;
+    out[length++] = '\n'; out[length] = 0;
+  }
+  return length;
+}
+// Human readable text for the reason of the last reset.
+static const char *resetReasonText(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "Power on";
+    case ESP_RST_EXT:       return "External reset pin";
+    case ESP_RST_SW:        return "Software restart";
+    case ESP_RST_PANIC:     return "Crash (panic / exception)";
+    case ESP_RST_INT_WDT:   return "Interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "Task watchdog";
+    case ESP_RST_WDT:       return "Other watchdog";
+    case ESP_RST_DEEPSLEEP: return "Deep sleep wake-up";
+    case ESP_RST_BROWNOUT:  return "Brownout (supply voltage too low)";
+    default:                return "Unknown";
+  }
+}
+// First thing at boot: save what the previous session left in RTC memory (last log lines, last steps), work out why the
+// bridge restarted, count the start and begin a fresh ring for this session.
+static void startDiagnosticsSession() {
+  g_logMutex = xSemaphoreCreateMutex();
+  esp_reset_reason_t reason = esp_reset_reason();
+  bool valid = g_rtcLog.magic == RTC_LOG_MAGIC && g_rtcLog.magicEnd == RTC_LOG_MAGIC && g_rtcLog.head < LOG_RING_LINES && g_rtcLog.count <= LOG_RING_LINES;
+  g_previousLogValid = valid && g_rtcLog.count > 0;
+  bool planned = valid && g_rtcLog.plannedRestart == RTC_LOG_MAGIC;
+  if (valid) {
+    joinRingLines(g_rtcLog, g_previousLog, sizeof(g_previousLog));
+    strlcpy(g_previousBleStep, g_rtcLog.bleStep, sizeof(g_previousBleStep));
+    strlcpy(g_previousMqttStep, g_rtcLog.mqttStep, sizeof(g_previousMqttStep));
+    strlcpy(g_previousWebStep, g_rtcLog.webStep, sizeof(g_previousWebStep));
+  }
+  if (reason == ESP_RST_SW && planned) snprintf(g_restartReason, sizeof(g_restartReason), "Software restart: %s", g_rtcLog.plannedReason);
+  else if (reason == ESP_RST_SW)       snprintf(g_restartReason, sizeof(g_restartReason), "Software restart (not requested from the web page)");
+  else                                 snprintf(g_restartReason, sizeof(g_restartReason), "%s", resetReasonText(reason));
+  memset(&g_rtcLog, 0, sizeof(g_rtcLog));                // fresh ring for this session
+  g_rtcLog.magic = g_rtcLog.magicEnd = RTC_LOG_MAGIC;
+  g_prefs.begin("cfg", false); g_bootCount = g_prefs.getUInt("boots", 0) + 1; g_prefs.putUInt("boots", g_bootCount); g_prefs.end();
+}
+// Restart on purpose and remember why, so the next start can tell it was not a crash.
+static void restartDevice(const char *why) {
+  strlcpy(g_rtcLog.plannedReason, why, sizeof(g_rtcLog.plannedReason));
+  g_rtcLog.plannedRestart = RTC_LOG_MAGIC;
+  logLine("boot", "restarting: %s", why);
+  ESP.restart();
+}
 
 // Copy the shared snapshot into a private copy (the only way readers look at it).
 static void copySnapshot(SharedState &destination) {
@@ -298,8 +421,8 @@ static void onPortalSettingsSaved() {
   g_detectedAddress[0] = 0;
   parsePasskey();
   g_haveTarget = false;
-  Serial.printf("[cfg] saved: host=%s port=%s user=%s addr=%s\n",
-                cfg_mqttHost, cfg_mqttPort, cfg_mqttUser, strlen(cfg_fireplaceAddress) ? cfg_fireplaceAddress : "(auto)");
+  logLine("cfg", "saved: host=%s port=%s user=%s addr=%s",
+          cfg_mqttHost, cfg_mqttPort, cfg_mqttUser, strlen(cfg_fireplaceAddress) ? cfg_fireplaceAddress : "(auto)");
 }
 
 // =====================================================================================================
@@ -310,19 +433,20 @@ static void onPortalSettingsSaved() {
 class FireplaceClientCallbacks : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient *) override {
     g_bleConnected = true;
-    Serial.printf("[%lu ms] [ble] connected\n", millis());
+    logLine("ble", "connected");
   }
   void onDisconnect(NimBLEClient *, int reason) override {
-    Serial.printf("[ble] disconnected (%d)\n", reason);
+    logLine("ble", "disconnected (%d)", reason);
+    // Only flags here. The characteristic pointers are NOT cleared: bleTask may be in the middle of a read or write, and a
+    // pointer that turns null under its hands crashes it (LoadProhibited). bleTask replaces them at the next connection,
+    // and every access goes through readRegister()/writeRegister(), which refuse to work while the link is down.
     g_bleConnected = g_blePaired = g_bleReady = g_initSent = false;
-    g_chControl = g_chFlameLevel = g_chClock = g_chInit = nullptr;
-    g_chHeater = g_chSetpoint = g_chHeaterPower = g_chTemperature = g_chUnknown3c = g_chUnknown63 = g_chSetpointLimits = g_chVolume = nullptr;
     g_clockSet = false; g_registersRead = false; g_limitsRead = false;
   }
   void onPassKeyEntry(NimBLEConnInfo &info) override { NimBLEDevice::injectPassKey(info, g_passkeyNumber); }
   void onConfirmPasskey(NimBLEConnInfo &info, uint32_t) override { NimBLEDevice::injectConfirmPasskey(info, true); }
   void onAuthenticationComplete(NimBLEConnInfo &info) override {
-    Serial.printf("[%lu ms] [sec] auth complete enc=%d\n", millis(), info.isEncrypted()); g_blePaired = info.isEncrypted();
+    logLine("sec", "auth complete enc=%d", info.isEncrypted()); g_blePaired = info.isEncrypted();
   }
 };
 
@@ -352,6 +476,13 @@ static bool findFireplaceCharacteristics() {
   return g_chControl != nullptr;
 }
 
+// Write `length` bytes to a register (with response). Returns false when the register is unknown, the link is down
+// (also when it dropped a moment ago) or the write failed. Never dereferences a null pointer.
+static bool writeRegister(NimBLERemoteCharacteristic *characteristic, const uint8_t *data, size_t length) {
+  if (!characteristic || !g_bleConnected) return false;
+  return characteristic->writeValue(data, length, true);
+}
+
 // Write the real local time to the fireplace clock (0x0012), in the format the remote uses:
 // century, year, month, day, hour, minute, flag, seconds (plain binary, not BCD).
 // Example: 2026-10-14 19:45:04 -> 14 1a 0a 0e 13 2d 01 04. The flag byte is always 01 as written by the remote.
@@ -363,17 +494,17 @@ static bool writeFireplaceClock() {
   int year = t.tm_year + 1900;
   uint8_t clock[8] = { (uint8_t)(year / 100), (uint8_t)(year % 100), (uint8_t)(t.tm_mon + 1), (uint8_t) t.tm_mday,
                        (uint8_t) t.tm_hour, (uint8_t) t.tm_min, 0x01, (uint8_t) t.tm_sec };
-  if (!g_chClock->writeValue(clock, sizeof(clock), true)) return false;
+  if (!writeRegister(g_chClock, clock, sizeof(clock))) return false;
   g_clockSet = true;
-  Serial.printf("[%lu ms] [ble] fireplace clock set to %04d-%02d-%02d %02d:%02d:%02d\n",
-                millis(), year, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+  logLine("ble", "fireplace clock set to %04d-%02d-%02d %02d:%02d:%02d",
+          year, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
   return true;
 }
 // Handshake the remote does after connecting: set the clock and write 0x0087 = 010100, then 000000.
 static void sendInitSequence() {
   uint8_t first[] = {0x01, 0x01, 0x00}, second[] = {0x00, 0x00, 0x00};
-  if (!writeFireplaceClock()) Serial.printf("[%lu ms] [ble] no valid time yet; clock write postponed\n", millis());
-  if (g_chInit) { g_chInit->writeValue(first, sizeof(first), true); delay(120); g_chInit->writeValue(second, sizeof(second), true); }
+  if (!writeFireplaceClock()) logLine("ble", "no valid time yet; clock write postponed");
+  writeRegister(g_chInit, first, sizeof(first)); delay(120); writeRegister(g_chInit, second, sizeof(second));
   g_initSent = true;
 }
 
@@ -385,13 +516,13 @@ static void bleReleaseLink() {
     uint32_t start = millis();
     while (g_bleConnected && millis() - start < 2000) delay(20);
   }
-  Serial.printf("[%lu ms] [ble] released (original remote can connect)\n", millis());
+  logLine("ble", "released (original remote can connect)");
 }
 // Allow connecting again; bleTask makes the next connect attempt immediately.
 static void bleResumeLink() {
   g_bleEnabled = true;
   g_lastConnectAttemptMs = millis() - (BLE_RETRY_INTERVAL_MS + 1000);
-  Serial.printf("[%lu ms] [ble] resume requested\n", millis());
+  logLine("ble", "resume requested");
 }
 
 // Scan for a fireplace by advertised name. Returns true and fills `found` on the first match.
@@ -410,7 +541,7 @@ static bool scanForFireplace(NimBLEAddress &found) {
 }
 // Scan and build the portal's <select> of found fireplaces (choosing one fills the address field).
 static void buildPortalScanList() {
-  Serial.println("[ble] scanning for fireplaces (setup portal)...");
+  logLine("ble", "scanning for fireplaces (setup portal)...");
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setActiveScan(true);
   NimBLEScanResults results = scan->getResults(4000, false);
@@ -431,13 +562,13 @@ static void buildPortalScanList() {
   html += "</select>";
   scan->clearResults();
   strlcpy(g_portalScanHtml, html.c_str(), sizeof(g_portalScanHtml));
-  Serial.printf("[ble] scan found %d fireplace(s)\n", count);
+  logLine("ble", "scan found %d fireplace(s)", count);
 }
 
 // One connect attempt: decide which fireplace (pinned address, remembered address or a scan), connect and pair.
 // May block for seconds (scan 4 s, connect timeout 5 s); that is fine because only bleTask waits.
 static void bleConnectToFireplace() {
-  Serial.printf("[%lu ms] [ble] Connecting\n", millis());
+  logLine("ble", "Connecting");
   if (g_bleConnected) return;
   if (!g_bleClient) {
     g_bleClient = NimBLEDevice::createClient();
@@ -449,29 +580,29 @@ static void bleConnectToFireplace() {
       g_targetAddress = NimBLEAddress(cfg_fireplaceAddress, BLE_ADDR_PUBLIC); g_haveTarget = true;
     } else if (strlen(g_detectedAddress) >= 17) {   // remembered from a previous auto-detect
       g_targetAddress = NimBLEAddress(g_detectedAddress, BLE_ADDR_PUBLIC); g_haveTarget = true;
-      Serial.printf("[ble] using remembered fireplace %s\n", g_detectedAddress);
+      logLine("ble", "using remembered fireplace %s", g_detectedAddress);
     } else if (scanForFireplace(g_targetAddress)) { // fresh auto-detect by name
       g_haveTarget = true;
       rememberDetectedAddress(g_targetAddress.toString().c_str());
-      Serial.printf("[ble] auto-detected fireplace %s (remembered)\n", g_detectedAddress);
+      logLine("ble", "auto-detected fireplace %s (remembered)", g_detectedAddress);
     } else {
-      Serial.println("[ble] no fireplace found in scan (will retry)"); return;
+      logLine("ble", "no fireplace found in scan (will retry)"); return;
     }
   }
   if (!g_bleClient->connect(g_targetAddress)) {
-    Serial.println("[ble] connect failed");
+    logLine("ble", "connect failed");
     if (!strlen(cfg_fireplaceAddress)) {            // auto mode: forget the target (and a remembered address) and re-scan
       g_haveTarget = false;
-      if (strlen(g_detectedAddress)) { Serial.println("[ble] forgetting remembered address; will re-scan"); rememberDetectedAddress(nullptr); }
+      if (strlen(g_detectedAddress)) { logLine("ble", "forgetting remembered address; will re-scan"); rememberDetectedAddress(nullptr); }
     }
     return;
   }
-  if (!g_bleClient->secureConnection()) { Serial.println("[ble] secure failed"); return; }
+  if (!g_bleClient->secureConnection()) { logLine("ble", "secure failed"); return; }
 }
 
 // Read up to maxLength bytes of a register into out[]. Returns the number of bytes read (0 = failed).
 static size_t readRegister(NimBLERemoteCharacteristic *characteristic, uint8_t *out, size_t maxLength) {
-  if (!characteristic) return 0;
+  if (!characteristic || !g_bleConnected) return 0;
   NimBLEAttValue value = characteristic->readValue();
   size_t length = value.length() < maxLength ? value.length() : maxLength;
   for (size_t i = 0; i < length; i++) out[i] = value[i];
@@ -540,8 +671,8 @@ static void readUntil(bool (*condition)(), uint32_t timeoutMs, const char *what)
   uint32_t start = millis();
   delay(250);
   readFireplaceState();
-  while (!condition() && millis() - start < timeoutMs) { delay(300); readFireplaceState(); }
-  Serial.printf("[%lu ms] [ble] %s: %s after %lu ms\n", millis(), what, condition() ? "state confirmed" : "state NOT confirmed", (unsigned long)(millis() - start));
+  while (!condition() && g_bleConnected && millis() - start < timeoutMs) { delay(300); readFireplaceState(); }
+  logLine("ble", "%s: %s after %lu ms", what, condition() ? "state confirmed" : "state NOT confirmed", (unsigned long)(millis() - start));
 }
 static int g_awaitedSetpoint = 0;                // target of the setpoint command being confirmed (bleTask only)
 static int g_awaitedHeaterPower = 0;             // target value of 0x0048 being confirmed (bleTask only)
@@ -558,8 +689,8 @@ static bool bleSetFlameEffect(bool on) {
   readFireplaceState();
   if (on && flameEffectIsOn()) { setMessage("Flame effect is already on"); return true; }
   if (!g_initSent) sendInitSequence();
-  uint8_t value = on ? 0x06 : 0x00; g_chControl->writeValue(&value, 1, true);
-  Serial.printf("[%lu ms] [ble] flame effect -> %s (0x0040=%02x)\n", millis(), on ? "ON" : "OFF", value);
+  uint8_t value = on ? 0x06 : 0x00; writeRegister(g_chControl, &value, 1);
+  logLine("ble", "flame effect -> %s (0x0040=%02x)", on ? "ON" : "OFF", value);
   setMessage(on ? "Flame effect switched on" : "Fireplace switched off (effect and heater)");
   if (on) readUntil([] { return flameEffectIsOn(); }, 4000, "flame effect on");
   else    readUntil([] { return !flameEffectIsOn(); }, 4000, "fireplace off");
@@ -571,8 +702,8 @@ static bool bleSetFlameLevel(uint8_t level) {
   if (!g_initSent) sendInitSequence();
   if (level < 1) level = 1;
   if (level > 6) level = 6;
-  g_chFlameLevel->writeValue(&level, 1, true);
-  Serial.printf("[ble] flame level -> %u\n", level);
+  writeRegister(g_chFlameLevel, &level, 1);
+  logLine("ble", "flame level -> %u", level);
   return true;
 }
 // Heater on: the remote writes 0x0040 = 01 and then 0x0014 = 02 00 (about 0.7 s later). Only while the flame effect is on.
@@ -584,16 +715,16 @@ static bool bleSetHeater(bool on) {
     if (!flameEffectIsOn()) { setMessage("Heater not started: switch the flame effect on first"); return false; }
     if (heaterIsOn())       { setMessage("Heater is already on"); return true; }
     uint8_t first = 0x01, second[2] = {0x02, 0x00};
-    g_chControl->writeValue(&first, 1, true);
+    writeRegister(g_chControl, &first, 1);
     delay(650);
-    g_chHeater->writeValue(second, 2, true);
-    Serial.printf("[%lu ms] [ble] heater -> ON (0x0040=01, 0x0014=0200)\n", millis());
+    writeRegister(g_chHeater, second, 2);
+    logLine("ble", "heater -> ON (0x0040=01, 0x0014=0200)");
     setMessage("Heater switched on");
     readUntil([] { return heaterIsOn(); }, 4000, "heater on"); return true;
   }
   if (!flameEffectIsOn() || !heaterIsOn()) { setMessage("Heater is already off"); return true; }
-  uint8_t value = 0x06; g_chControl->writeValue(&value, 1, true);
-  Serial.printf("[%lu ms] [ble] heater -> OFF (0x0040=06)\n", millis());
+  uint8_t value = 0x06; writeRegister(g_chControl, &value, 1);
+  logLine("ble", "heater -> OFF (0x0040=06)");
   setMessage("Heater switched off");
   readUntil([] { return !heaterIsOn(); }, 4000, "heater off"); return true;
 }
@@ -605,8 +736,8 @@ static bool bleSetSetpoint(int degrees) {
   if (degrees < g_setpointMin) degrees = g_setpointMin;
   if (degrees > g_setpointMax) degrees = g_setpointMax;
   uint8_t bytes[2] = {(uint8_t)(degrees & 0xff), (uint8_t)(degrees >> 8)};
-  g_chSetpoint->writeValue(bytes, 2, true);
-  Serial.printf("[%lu ms] [ble] setpoint -> %d C\n", millis(), degrees);
+  writeRegister(g_chSetpoint, bytes, 2);
+  logLine("ble", "setpoint -> %d C", degrees);
   g_awaitedSetpoint = degrees;
   readUntil([] { return g_setpoint == g_awaitedSetpoint; }, 3000, "setpoint");
   setMessage((g_setpoint == degrees) ? "Setpoint set to " + String(degrees) + " C"
@@ -619,8 +750,8 @@ static bool bleSetHeaterPower(bool high) {
   readFireplaceState();
   if (!heaterIsOn()) { setMessage("Heater power not changed: the heater is off"); return false; }
   uint8_t value = high ? 0x03 : 0x01;
-  bool ok = g_chHeaterPower->writeValue(&value, 1, true);
-  Serial.printf("[%lu ms] [ble] heater power -> %s (0x0048=%02x) write=%d\n", millis(), high ? "HIGH" : "LOW", value, ok);
+  bool ok = writeRegister(g_chHeaterPower, &value, 1);
+  logLine("ble", "heater power -> %s (0x0048=%02x) write=%d", high ? "HIGH" : "LOW", value, ok);
   g_awaitedHeaterPower = value;
   readUntil([] { return g_regHeaterPower == g_awaitedHeaterPower; }, 3000, "heater power");
   if (g_regHeaterPower == value) setMessage(String("Heater power set to ") + (high ? "high" : "low") + " (read back OK)");
@@ -633,8 +764,8 @@ static int g_awaitedVolume = 0;                  // target of the volume command
 static bool bleSetVolume(uint8_t volume) {
   if (!g_bleReady || !g_chVolume) { setMessage("Not connected to the fireplace"); return false; }
   if (volume > 6) volume = 6;
-  g_chVolume->writeValue(&volume, 1, true);
-  Serial.printf("[ble] volume -> %u\n", volume);
+  writeRegister(g_chVolume, &volume, 1);
+  logLine("ble", "volume -> %u", volume);
   g_awaitedVolume = volume;
   readUntil([] { return g_volume == g_awaitedVolume; }, 2000, "volume");
   setMessage("Volume " + String(volume));
@@ -695,7 +826,7 @@ static void bleApplyPendingSettings() {
   bleReleaseLink();                                 // drop the current link ...
   if (wasEnabled) bleResumeLink();                  // ... and reconnect with the new settings (unless the link was released on purpose)
   setMessage(String("Fireplace settings saved: ") + (cfg_fireplaceAddress[0] ? cfg_fireplaceAddress : "auto-detect"));
-  Serial.printf("[cfg] fireplace=%s passkey=%s\n", cfg_fireplaceAddress[0] ? cfg_fireplaceAddress : "(auto)", cfg_passkeyText);
+  logLine("cfg", "fireplace=%s passkey=%s", cfg_fireplaceAddress[0] ? cfg_fireplaceAddress : "(auto)", cfg_passkeyText);
 }
 // Factory reset: drop the BLE link, erase all saved settings (including the Wi-Fi credentials) and restart.
 // After the restart there is no Wi-Fi to join, so the 'Dimplex-Setup' portal opens, like after a physical reset.
@@ -705,13 +836,26 @@ static void bleFactoryReset() {
   bleReleaseLink();
   g_prefs.begin("cfg", false); g_prefs.clear(); g_prefs.end();
   g_wifiManager.resetSettings();
-  Serial.printf("[%lu ms] [cfg] factory reset done, restarting\n", millis());
+  logLine("cfg", "factory reset done, restarting");
   delay(1500);                                      // let the web page show its message
-  ESP.restart();
+  restartDevice("factory reset");
 }
 
+// Short name of a command for the "last step" breadcrumb.
+static const char *commandName(CommandType type) {
+  switch (type) {
+    case CMD_FLAME_EFFECT: return "flame effect";   case CMD_HEATER: return "heater";
+    case CMD_HEATER_POWER: return "heater power";   case CMD_SETPOINT: return "setpoint";
+    case CMD_SETPOINT_DELTA: return "setpoint +/-"; case CMD_FLAME_LEVEL: return "flame level";
+    case CMD_VOLUME: return "volume";               case CMD_BLE_RELEASE: return "bluetooth release";
+    case CMD_BLE_RESUME: return "bluetooth resume"; case CMD_SCAN: return "scan";
+    case CMD_APPLY_SETTINGS: return "apply settings"; case CMD_FACTORY_RESET: return "factory reset";
+  }
+  return "?";
+}
 // Execute one queued command (web or MQTT) and log its result message.
 static void executeCommand(const Command &c) {
+  char step[STEP_TEXT_LENGTH]; snprintf(step, sizeof(step), "command: %s (%d)", commandName(c.type), c.argument); setBleStep(step);
   switch (c.type) {
     case CMD_FLAME_EFFECT: bleSetFlameEffect(c.argument != 0); break;
     case CMD_HEATER:       bleSetHeater(c.argument != 0); break;
@@ -729,7 +873,7 @@ static void executeCommand(const Command &c) {
     case CMD_BLE_RELEASE:  bleReleaseLink(); setMessage("Bluetooth released"); break;
     case CMD_BLE_RESUME:   bleResumeLink(); setMessage("Connecting..."); break;
   }
-  if (g_messageDirty) Serial.printf("[%lu ms] [%s] %s\n", millis(), c.source == SOURCE_MQTT ? "mqtt" : "web", g_message.c_str());
+  if (g_messageDirty) logLine(c.source == SOURCE_MQTT ? "mqtt" : "web", "%s", g_message.c_str());
 }
 
 // BLE task: connects (and reconnects) to the fireplace, runs the queued commands in order and
@@ -738,19 +882,24 @@ static void bleTask(void *) {
   uint32_t lastPollMs = 0, lastClockTryMs = 0;
   bool lastReady = false, lastConnected = false, lastEnabled = true;
   for (;;) {
+    setBleStep("idle");
     if (g_bleEnabled && !g_bleConnected && millis() - g_lastConnectAttemptMs > BLE_RETRY_INTERVAL_MS) {
       g_lastConnectAttemptMs = millis();
+      setBleStep("connecting to the fireplace");
       bleConnectToFireplace();
     }
     if (g_bleConnected && g_blePaired && !g_bleReady) {
-      if (findFireplaceCharacteristics()) {
+      setBleStep("finding the registers");
+      bool found = findFireplaceCharacteristics();         // takes seconds; the link can drop meanwhile
+      if (found && g_bleConnected && g_blePaired) {
         g_bleReady = true;
+        setBleStep("handshake and first read");
         sendInitSequence();
         readFireplaceState();
         lastPollMs = millis();
         g_bleReadyCount = g_bleReadyCount + 1;             // tells the MQTT task to republish everything
         publishSnapshot();
-        Serial.printf("[%lu ms] [ble] ready\n", millis());
+        logLine("ble", "ready");
       }
     }
     if (g_bleReady && !g_clockSet && millis() - lastClockTryMs > 2000) { lastClockTryMs = millis(); writeFireplaceClock(); }  // retry until NTP has a valid time
@@ -764,7 +913,7 @@ static void bleTask(void *) {
       g_commandRunning = false;
       lastPollMs = millis();
     }
-    if (g_bleReady && millis() - lastPollMs > FIREPLACE_POLL_INTERVAL_MS) { lastPollMs = millis(); readFireplaceState(); publishSnapshot(); }
+    if (g_bleReady && millis() - lastPollMs > FIREPLACE_POLL_INTERVAL_MS) { lastPollMs = millis(); setBleStep("polling the registers"); readFireplaceState(); publishSnapshot(); }
     if (lastReady != g_bleReady || lastConnected != g_bleConnected || lastEnabled != g_bleEnabled) {   // link state changed (callbacks run in the NimBLE host task)
       lastReady = g_bleReady; lastConnected = g_bleConnected; lastEnabled = g_bleEnabled;
       publishSnapshot();
@@ -780,10 +929,14 @@ static void bleTask(void *) {
 static int g_publishedBleEnabled = -1;       // 0/1
 static int g_publishedPower = -1, g_publishedFlameLevel = -1, g_publishedHeater = -1;
 static int g_publishedHeaterPower = -1;        // 0 = low, 1 = high, 2 = unknown value
-static int g_publishedSetpoint = -1;           // last setpoint seen while the heater was on
-static char g_publishedTemperature[10] = "";   // e.g. "24.3"
+static int g_publishedSetpoint = -1;           // degrees; SETPOINT_NONE = "unknown" was published (heater off)
+static int g_publishedTemperatureTenths = -1;  // tenths of a degree (243 = 24.3); SETPOINT_NONE = "unknown" was published
+static const int SETPOINT_NONE = -2;           // marker for "published as unknown"
+static const int TEMPERATURE_DEADBAND_TENTHS = 2;   // the temperature is only published when it moved by at least 0.2 degrees
 static char g_publishedRaw[120] = "";
 static bool g_brokerKnown = false;             // the broker address has been resolved
+static bool g_diagnosticsDue = true;           // publish the diagnostics at the next chance (after connecting, then every 60 s)
+static uint32_t g_lastDiagnosticsMs = 0;
 
 // ---- immediate echo of MQTT commands ----
 // A command takes about a second to execute on the fireplace. Home Assistant switches wait for the state topic and
@@ -796,6 +949,12 @@ static uint32_t g_holdDeadlineMs = 0;
 static bool holdingForCommand() {
   return g_holdUntilCompleted != 0 && g_commandsCompleted.load() < g_holdUntilCompleted && (int32_t)(g_holdDeadlineMs - millis()) > 0;
 }
+// Tell Home Assistant the setpoint is unknown (shown as "unknown" instead of an old value). Used while the heater is off,
+// because the fireplace only has a setpoint while the heater runs.
+static void publishSetpointUnknown() {
+  if (g_publishedSetpoint == SETPOINT_NONE) return;
+  g_mqttClient.publish(TOPIC_SETPOINT_STATE, "None", true); g_publishedSetpoint = SETPOINT_NONE;
+}
 // Publish the state we expect after a command, and start holding back older values.
 static void echoExpectedState(CommandType type, int argument) {
   bool echoed = false;
@@ -804,10 +963,10 @@ static void echoExpectedState(CommandType type, int argument) {
   switch (type) {
     case CMD_FLAME_EFFECT:
       publishOnOff(TOPIC_POWER_STATE, g_publishedPower, argument != 0);
-      if (!argument) publishOnOff(TOPIC_HEATER_STATE, g_publishedHeater, false);       // everything off includes the heater
+      if (!argument) { publishOnOff(TOPIC_HEATER_STATE, g_publishedHeater, false); publishSetpointUnknown(); }       // everything off includes the heater
       break;
     case CMD_HEATER:
-      if (!argument) publishOnOff(TOPIC_HEATER_STATE, g_publishedHeater, false);
+      if (!argument) { publishOnOff(TOPIC_HEATER_STATE, g_publishedHeater, false); publishSetpointUnknown(); }
       else if (isFlameEffectOn(s)) publishOnOff(TOPIC_HEATER_STATE, g_publishedHeater, true);   // only works while the effect is on
       break;
     case CMD_SETPOINT:
@@ -831,7 +990,8 @@ static void queueMqttCommand(CommandType type, int argument) {
 static void forgetPublishedValues() {
   g_publishedBleEnabled = -1;
   g_publishedPower = g_publishedFlameLevel = g_publishedHeater = g_publishedHeaterPower = g_publishedSetpoint = -1;
-  g_publishedTemperature[0] = 0; g_publishedRaw[0] = 0;
+  g_publishedTemperatureTenths = -1; g_publishedRaw[0] = 0;
+  g_diagnosticsDue = true;
 }
 
 // Publish one Home Assistant discovery config: homeassistant/<component>/dimplex/<objectId>/config.
@@ -847,9 +1007,29 @@ static void removeEntity(const char *component, const char *objectId) {
   String topic = String("homeassistant/") + component + "/dimplex/" + objectId + "/config";
   g_mqttClient.publish(topic.c_str(), "", true);
 }
+// One diagnostic sensor that reads a key of the JSON on dimplex/diag/state. `extra` = more discovery fields (unit, class, icon).
+static void publishDiagnosticSensor(const char *objectId, const char *name, const char *jsonKey, const char *extra) {
+  publishEntity("sensor", objectId, String("\"name\":\"") + name + "\",\"uniq_id\":\"dimplex_" + objectId + "\",\"stat_t\":\"" + TOPIC_DIAG_STATE +
+                "\",\"val_tpl\":\"{{ value_json." + jsonKey + " }}\",\"ent_cat\":\"diagnostic\"," + extra +
+                ",\"avty_t\":\"" + TOPIC_AVAILABILITY + "\"");
+}
+// The diagnostic sensors: why the bridge restarted, how long it has been running, memory, signal strength and counters.
+static void publishDiagnosticDiscovery() {
+  publishDiagnosticSensor("diag_restart_reason", "Last restart reason", "restart_reason", "\"ic\":\"mdi:restart-alert\"");
+  publishDiagnosticSensor("diag_restart_count", "Restart count", "restart_count", "\"stat_cla\":\"total_increasing\",\"ic\":\"mdi:counter\"");
+  publishDiagnosticSensor("diag_uptime", "Uptime", "uptime", "\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\",\"stat_cla\":\"measurement\"");
+  publishDiagnosticSensor("diag_free_heap", "Free memory", "free_heap", "\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ic\":\"mdi:memory\"");
+  publishDiagnosticSensor("diag_min_heap", "Lowest free memory", "min_heap", "\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ic\":\"mdi:memory\"");
+  publishDiagnosticSensor("diag_wifi", "Wi-Fi signal", "wifi_rssi", "\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"stat_cla\":\"measurement\"");
+  publishDiagnosticSensor("diag_ble_connects", "Bluetooth connections", "ble_connects", "\"stat_cla\":\"total_increasing\",\"ic\":\"mdi:bluetooth-connect\"");
+  publishDiagnosticSensor("diag_mqtt_failures", "MQTT connect failures", "mqtt_failures", "\"stat_cla\":\"total_increasing\",\"ic\":\"mdi:lan-disconnect\"");
+  publishDiagnosticSensor("diag_stack_ble", "Free stack BLE task", "stack_ble", "\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ic\":\"mdi:memory\"");
+  publishDiagnosticSensor("diag_stack_mqtt", "Free stack MQTT task", "stack_mqtt", "\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ic\":\"mdi:memory\"");
+}
 // Publish all Home Assistant entities and remove the ones that no longer exist (water sensor, volume,
 // and the old read-only heater and setpoint sensors that are now switch / number).
 static void publishHomeAssistantDiscovery() {
+  setMqttStep("publishing discovery");
   String avail = String(",\"avty_t\":\"") + TOPIC_AVAILABILITY + "\"";
   removeEntity("binary_sensor", "water");
   removeEntity("number", "volume");
@@ -876,7 +1056,8 @@ static void publishHomeAssistantDiscovery() {
                 "\",\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\",\"stat_cla\":\"measurement\"" + avail);
   publishEntity("sensor", "raw", String("\"name\":\"Raw registers\",\"uniq_id\":\"dimplex_raw\",\"stat_t\":\"") + TOPIC_RAW_STATE +
                 "\",\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:code-braces\"" + avail);
-  Serial.println("[mqtt] discovery published");
+  publishDiagnosticDiscovery();
+  logLine("mqtt", "discovery published");
 }
 
 // Incoming MQTT message: turn it into a queued command and echo the expected state (see echoExpectedState). No BLE in here.
@@ -902,10 +1083,10 @@ static void resolveMqttBroker() {
   if (host.endsWith(".local")) {
     IPAddress resolved = MDNS.queryHost(host.substring(0, host.length() - 6), 2000);
     if ((uint32_t) resolved != 0) {
-      Serial.printf("[mdns] %s -> %s\n", cfg_mqttHost, resolved.toString().c_str());
+      logLine("mdns", "%s -> %s", cfg_mqttHost, resolved.toString().c_str());
       g_mqttClient.setServer(resolved, (uint16_t) atoi(cfg_mqttPort)); g_brokerKnown = true;
     } else {
-      Serial.printf("[mdns] could not resolve %s (retrying)\n", cfg_mqttHost);
+      logLine("mdns", "could not resolve %s (retrying)", cfg_mqttHost);
       g_brokerKnown = false;
     }
     return;
@@ -921,7 +1102,7 @@ static bool tryMqttConnect() {
   if (millis() - lastAttemptMs < waitMs) return false;
   lastAttemptMs = millis();
   if (g_mqttClient.connect("dimplex-control", cfg_mqttUser, cfg_mqttPassword, TOPIC_AVAILABILITY, 0, true, "offline")) {
-    Serial.printf("[%lu ms] [mqtt] connected\n", millis());
+    logLine("mqtt", "connected");
     g_mqttClient.publish(TOPIC_AVAILABILITY, "online", true);
     g_mqttClient.subscribe(TOPIC_POWER_SET); g_mqttClient.subscribe(TOPIC_FLAME_LEVEL_SET);
     g_mqttClient.subscribe(TOPIC_HEATER_SET); g_mqttClient.subscribe(TOPIC_SETPOINT_SET); g_mqttClient.subscribe(TOPIC_BLE_SET);
@@ -931,7 +1112,7 @@ static bool tryMqttConnect() {
     return true;
   }
   g_mqttFailCount = g_mqttFailCount + 1;
-  Serial.printf("[mqtt] connect failed rc=%d (next try in %lu s)\n", g_mqttClient.state(), (unsigned long)(waitMs * 2 > 30000 ? 30 : waitMs * 2 / 1000));
+  logLine("mqtt", "connect failed rc=%d (next try in %lu s)", g_mqttClient.state(), (unsigned long)(waitMs * 2 > 30000 ? 30 : waitMs * 2 / 1000));
   waitMs = waitMs * 2 > 30000 ? 30000 : waitMs * 2;
   if (++failures >= 3) { failures = 0; g_brokerKnown = false; }   // the broker IP may have changed
   return false;
@@ -941,31 +1122,58 @@ static void publishChanges(const SharedState &s) {
   bool hold = holdingForCommand();                          // older values of the controlled entities are skipped while true
   if (!hold && (int) s.bleEnabled != g_publishedBleEnabled) {       // known even while the link is released
     g_mqttClient.publish(TOPIC_BLE_STATE, s.bleEnabled ? "ON" : "OFF", true); g_publishedBleEnabled = s.bleEnabled;
-    Serial.printf("[%lu ms] [pub] ble link enabled=%d\n", millis(), s.bleEnabled);
+    logLine("pub", "ble link enabled=%d", s.bleEnabled);
   }
-  if (!s.valid) return;
+  if (!s.valid) {                                           // no reading yet (e.g. after a restart): do not show old retained values
+    publishSetpointUnknown();
+    if (g_publishedTemperatureTenths != SETPOINT_NONE) { g_mqttClient.publish(TOPIC_TEMPERATURE_STATE, "None", true); g_publishedTemperatureTenths = SETPOINT_NONE; }
+    return;
+  }
   bool effectOn = (s.regControl[0] != 0);
-  if (!hold && (int) effectOn != g_publishedPower) { g_mqttClient.publish(TOPIC_POWER_STATE, effectOn ? "ON" : "OFF", true); g_publishedPower = effectOn; Serial.printf("[%lu ms] [pub] power=%d\n", millis(), effectOn); }
+  if (!hold && (int) effectOn != g_publishedPower) { g_mqttClient.publish(TOPIC_POWER_STATE, effectOn ? "ON" : "OFF", true); g_publishedPower = effectOn; logLine("pub", "power=%d", effectOn); }
   if (s.flameLevel >= 1 && s.flameLevel != g_publishedFlameLevel) {          // 0x0042 = flame intensity (independent of power)
     char text[4]; snprintf(text, sizeof(text), "%u", s.flameLevel); g_mqttClient.publish(TOPIC_FLAME_LEVEL_STATE, text, true); g_publishedFlameLevel = s.flameLevel;
-    Serial.printf("[%lu ms] [pub] level=%u\n", millis(), s.flameLevel);
+    logLine("pub", "level=%u", s.flameLevel);
   }
   bool heaterOn = isHeaterOn(s);
-  if (!hold && (int) heaterOn != g_publishedHeater) { g_mqttClient.publish(TOPIC_HEATER_STATE, heaterOn ? "ON" : "OFF", true); g_publishedHeater = heaterOn; Serial.printf("[%lu ms] [pub] heater=%d\n", millis(), heaterOn); }
+  if (!hold && (int) heaterOn != g_publishedHeater) { g_mqttClient.publish(TOPIC_HEATER_STATE, heaterOn ? "ON" : "OFF", true); g_publishedHeater = heaterOn; logLine("pub", "heater=%d", heaterOn); }
   int powerCode = (s.regHeaterPower == 0x01) ? 0 : (s.regHeaterPower == 0x03 ? 1 : 2);
   if (powerCode != g_publishedHeaterPower) {
     char text[12]; if (powerCode == 2) snprintf(text, sizeof(text), "raw %02x", s.regHeaterPower); else snprintf(text, sizeof(text), "%s", powerCode ? "high" : "low");
     g_mqttClient.publish(TOPIC_HEATER_POWER_STATE, text, true); g_publishedHeaterPower = powerCode;
   }
-  if (!hold && s.setpoint > 0 && s.setpoint != g_publishedSetpoint) { char text[12]; snprintf(text, sizeof(text), "%d", s.setpoint); g_mqttClient.publish(TOPIC_SETPOINT_STATE, text, true); g_publishedSetpoint = s.setpoint; }
-  char temperature[10]; snprintf(temperature, sizeof(temperature), "%u.%u", s.regTemperature[1], s.regTemperature[2] % 10);
-  if (strcmp(temperature, g_publishedTemperature) != 0) { g_mqttClient.publish(TOPIC_TEMPERATURE_STATE, temperature, true); strlcpy(g_publishedTemperature, temperature, sizeof(g_publishedTemperature)); }
+  if (!hold) {
+    if (heaterOn && s.setpoint > 0) {
+      if (s.setpoint != g_publishedSetpoint) { char text[12]; snprintf(text, sizeof(text), "%d", s.setpoint); g_mqttClient.publish(TOPIC_SETPOINT_STATE, text, true); g_publishedSetpoint = s.setpoint; }
+    } else if (!heaterOn) {
+      publishSetpointUnknown();                              // heater off: no setpoint
+    }
+  }
+  int temperatureTenths = s.regTemperature[1] * 10 + s.regTemperature[2] % 10;
+  int temperatureChange = temperatureTenths - g_publishedTemperatureTenths;
+  if (g_publishedTemperatureTenths < 0 || temperatureChange >= TEMPERATURE_DEADBAND_TENTHS || -temperatureChange >= TEMPERATURE_DEADBAND_TENTHS) {
+    char temperature[10]; snprintf(temperature, sizeof(temperature), "%d.%d", temperatureTenths / 10, temperatureTenths % 10);
+    g_mqttClient.publish(TOPIC_TEMPERATURE_STATE, temperature, true); g_publishedTemperatureTenths = temperatureTenths;
+  }
   char hexControl[6], hexHeater[6], hexSetpoint[6], hexPower[4], hexTemperature[8], hex3c[8], hex63[6], raw[120];
   uint8_t setpointBytes[2] = {(uint8_t)(s.setpoint & 0xff), (uint8_t)(s.setpoint >> 8)};
   bytesToHex(hexControl, s.regControl, 2); bytesToHex(hexHeater, s.regHeater, 2); bytesToHex(hexSetpoint, setpointBytes, 2);
   bytesToHex(hexPower, &s.regHeaterPower, 1); bytesToHex(hexTemperature, s.regTemperature, 3); bytesToHex(hex3c, s.regUnknown3c, 3); bytesToHex(hex63, s.regUnknown63, 2);
   snprintf(raw, sizeof(raw), "40=%s 14=%s 18=%s 48=%s 55=%s 3c=%s 63=%s", hexControl, hexHeater, hexSetpoint, hexPower, hexTemperature, hex3c, hex63);
   if (strcmp(raw, g_publishedRaw) != 0) { g_mqttClient.publish(TOPIC_RAW_STATE, raw, true); strlcpy(g_publishedRaw, raw, sizeof(g_publishedRaw)); }
+}
+
+// Publish the health values as one JSON message (retained). Called after connecting and then every 60 s.
+static void publishDiagnostics() {
+  char json[420];
+  snprintf(json, sizeof(json),
+           "{\"restart_reason\":\"%s\",\"restart_count\":%lu,\"uptime\":%lu,\"free_heap\":%lu,\"min_heap\":%lu,\"wifi_rssi\":%d,"
+           "\"ble_connects\":%lu,\"mqtt_failures\":%lu,\"stack_ble\":%lu,\"stack_mqtt\":%lu}",
+           g_restartReason, (unsigned long) g_bootCount, (unsigned long) (esp_timer_get_time() / 1000000ULL), (unsigned long) ESP.getFreeHeap(),
+           (unsigned long) ESP.getMinFreeHeap(), (int) WiFi.RSSI(), (unsigned long) g_bleReadyCount, (unsigned long) g_mqttFailCount,
+           (unsigned long) g_bleStackFree, (unsigned long) g_mqttStackFree);
+  g_mqttClient.publish(TOPIC_DIAG_STATE, json, true);
+  g_diagnosticsDue = false; g_lastDiagnosticsMs = millis();
 }
 
 // MQTT task: keeps the broker connection (with backoff), handles incoming commands and publishes
@@ -978,16 +1186,19 @@ static void mqttTask(void *) {
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) { g_mqttUp = false; vTaskDelay(pdMS_TO_TICKS(500)); continue; }
     if (!g_brokerKnown) {
-      if (lastResolveMs == 0 || millis() - lastResolveMs > 4000) { lastResolveMs = millis(); resolveMqttBroker(); }
+      if (lastResolveMs == 0 || millis() - lastResolveMs > 4000) { lastResolveMs = millis(); setMqttStep("resolving the broker"); resolveMqttBroker(); }
     } else if (!g_mqttClient.connected()) {
       g_mqttUp = false;
+      setMqttStep("connecting to the broker");
       if (tryMqttConnect()) { lastVersion = 0xFFFFFFFF; lastBleReadyCount = g_bleReadyCount; }   // force a full publish
     } else {
       g_mqttUp = true;
+      setMqttStep("client loop");
       g_mqttClient.loop();
       if (g_holdUntilCompleted != 0 && !holdingForCommand()) { g_holdUntilCompleted = 0; lastVersion = 0xFFFFFFFF; }   // hold over: publish the real state
       if (lastBleReadyCount != g_bleReadyCount) { lastBleReadyCount = g_bleReadyCount; forgetPublishedValues(); lastVersion = 0xFFFFFFFF; }   // BLE link (re)established
-      if (lastVersion != g_sharedVersion) { lastVersion = g_sharedVersion; copySnapshot(g_mqttSnapshot); publishChanges(g_mqttSnapshot); }
+      if (lastVersion != g_sharedVersion) { lastVersion = g_sharedVersion; copySnapshot(g_mqttSnapshot); setMqttStep("publishing changes"); publishChanges(g_mqttSnapshot); }
+      if (g_diagnosticsDue || millis() - g_lastDiagnosticsMs > 60000) { setMqttStep("publishing diagnostics"); publishDiagnostics(); }
     }
     g_mqttStackFree = uxTaskGetStackHighWaterMark(nullptr);
     vTaskDelay(pdMS_TO_TICKS(10));                 // feeds the watchdog and leaves Wi-Fi/BLE CPU time on core 0
@@ -1015,14 +1226,56 @@ static String setHref(const String &query) {
   if (strcmp(g_renderPage, PAGE_MAIN) != 0) href += String("&r=") + g_renderPage;
   return href;
 }
+// ---- feedback for pressed buttons ----
+// After a button press the requested choice is shown in red ("wait") until the fireplace really reports it; only then it turns
+// orange ("on", the current state). Only the web layer (loop(), core 1) touches this table.
+static AwaitedValue g_awaited[AW_COUNT];
+static const uint32_t AWAIT_SETTLE_MS = 2000;     // after all commands finished, wait this long for the state to show up
+static const uint32_t AWAIT_GIVE_UP_MS = 15000;   // never show "waiting" longer than this
+
+// Remember that the user asked for `target` on `control` (choices: on = 1 / off = 0, level number, degrees...).
+static void awaitControl(AwaitedControl control, int target) { g_awaited[control] = { true, target, millis() }; }
+// True when the fireplace state in `s` already equals the requested `target` of `control`.
+static bool awaitedTargetReached(AwaitedControl control, int target, const SharedState &s) {
+  switch (control) {
+    case AW_BLE:          return target ? (s.bleEnabled && s.ready) : !s.bleEnabled;
+    case AW_EFFECT:       return (isFlameEffectOn(s) ? 1 : 0) == target;
+    case AW_HEATER:       return (isHeaterOn(s) ? 1 : 0) == target;
+    case AW_HEATER_POWER: return s.regHeaterPower == (target ? 0x03 : 0x01);
+    case AW_SETPOINT:     return s.setpoint == target;
+    case AW_FLAME_LEVEL:  return s.flameLevel == target;
+    case AW_VOLUME:       return s.volume == target;
+    default:              return true;
+  }
+}
+// Clear the entries that are confirmed, failed (nothing pending any more) or too old. Called before each live block is built.
+static void updateAwaited(const SharedState &s, uint32_t pending) {
+  for (int i = 0; i < AW_COUNT; i++) {
+    AwaitedValue &a = g_awaited[i];
+    if (!a.active) continue;
+    uint32_t age = millis() - a.sinceMs;
+    if (awaitedTargetReached((AwaitedControl) i, a.target, s) || age > AWAIT_GIVE_UP_MS || (pending == 0 && age > AWAIT_SETTLE_MS)) a.active = false;
+  }
+}
+static bool anyAwaited() { for (int i = 0; i < AW_COUNT; i++) if (g_awaited[i].active) return true; return false; }
+
+// A choice button. Colours: green = current state "on" (or any selected value), red = current state "off",
+// orange = this choice was requested but the fireplace has not confirmed it yet, grey = not selected.
+// While a request for this control is open, the old state is not coloured, so only one button has a colour.
+static String choiceButton(const String &label, const String &href, bool isCurrent, AwaitedControl control, int choice) {
+  const AwaitedValue &a = g_awaited[control];
+  bool isOffChoice = (choice == 0) && (control == AW_BLE || control == AW_EFFECT || control == AW_HEATER);
+  const char *style = a.active ? (a.target == choice ? " wait" : "") : (isCurrent ? (isOffChoice ? " off" : " on") : "");
+  return "<a class='b" + String(style) + "' href='" + href + "'>" + label + "</a> ";
+}
 // An <a> styled as a button; `highlighted` = the current choice.
 static String linkButton(const String &label, const String &href, bool highlighted) {
   return "<a class='b" + String(highlighted ? " on" : "") + "' href='" + href + "'>" + label + "</a> ";
 }
 // A row of numbered buttons from `first` to `last` that all send /set?<parameter>=<number>.
-static String linkButtonRow(const char *parameter, int current, int first, int last, const char *labelPrefix = "") {
+static String linkButtonRow(const char *parameter, AwaitedControl control, int current, int first, int last, const char *labelPrefix = "") {
   String html;
-  for (int i = first; i <= last; i++) html += linkButton(String(labelPrefix) + String(i), setHref(String(parameter) + "=" + i), i == current);
+  for (int i = first; i <= last; i++) html += choiceButton(String(labelPrefix) + String(i), setHref(String(parameter) + "=" + i), i == current, control, i);
   return html;
 }
 // Escape text for use inside HTML ("<Dimplex>" in a device name would otherwise vanish).
@@ -1055,7 +1308,7 @@ static void setWebMessage(const String &text) { g_webMessage = text; g_webMessag
 // the result messages of the last actions, and the "working" line.
 static String buildLiveHeader(const SharedState &s, uint32_t pending) {
   String h;
-  if (pending || s.scanning || (s.bleEnabled && !s.ready)) h += "<span data-busy hidden></span>";
+  if (pending || anyAwaited() || s.scanning || (s.bleEnabled && !s.ready)) h += "<span data-busy hidden></span>";
   if (g_webMessage.length() && millis() - g_webMessageTimeMs < MESSAGE_SHOW_TIME_MS) h += "<p class=msg>" + g_webMessage + "</p>";
   if (s.message[0] && millis() - s.messageTimeMs < MESSAGE_SHOW_TIME_MS) h += "<p class=msg>" + htmlEscape(s.message) + "</p>";
   if (pending) h += "<p class=dim>Working&hellip; (" + String(pending) + " command" + (pending > 1 ? "s" : "") + " in progress)</p>";
@@ -1067,21 +1320,21 @@ static String buildMainLive(const SharedState &s) {
   bool ready = s.ready && s.valid;
   bool effectOn = ready && isFlameEffectOn(s), heaterOn = ready && isHeaterOn(s);
   String h;
-  h += "<h3>Bluetooth</h3>" + linkButton("Connected", setHref("ble=on"), s.bleEnabled) + linkButton("Released (use remote)", setHref("ble=off"), !s.bleEnabled);
+  h += "<h3>Bluetooth</h3>" + choiceButton("Connected", setHref("ble=on"), s.bleEnabled, AW_BLE, 1) + choiceButton("Released (use remote)", setHref("ble=off"), !s.bleEnabled, AW_BLE, 0);
   h += "<p class=dim>";
   if (!s.bleEnabled)  h += "Released: the original remote can connect. Values below are the last known.";
   else if (s.ready)   h += "Connected and paired to the fireplace.";
   else                h += "Connecting to the fireplace&hellip;";
   h += "</p>";
 
-  h += "<h3>Flame effect</h3>" + linkButton("On", setHref("fx=on"), effectOn) + linkButton("Off (all off)", setHref("fx=off"), ready && !effectOn);
+  h += "<h3>Flame effect</h3>" + choiceButton("On", setHref("fx=on"), effectOn, AW_EFFECT, 1) + choiceButton("Off (all off)", setHref("fx=off"), ready && !effectOn, AW_EFFECT, 0);
 
-  h += "<h3>Heater</h3>" + linkButton("On", setHref("heater=on"), heaterOn) + linkButton("Off", setHref("heater=off"), ready && effectOn && !heaterOn);
+  h += "<h3>Heater</h3>" + choiceButton("On", setHref("heater=on"), heaterOn, AW_HEATER, 1) + choiceButton("Off", setHref("heater=off"), ready && effectOn && !heaterOn, AW_HEATER, 0);
   h += "<p class=dim>The heater can only be started while the flame effect is on.</p>";
 
   h += "<h3>Setpoint</h3>";
   if (heaterOn) {
-    h += linkButton("&minus;1", setHref("spd=-1"), false) + "<b class=big>" + String(s.setpoint) + "&deg;C</b> " + linkButton("+1", setHref("spd=1"), false);
+    h += linkButton("&minus;1", setHref("spd=-1"), false) + "<b class='big" + String(g_awaited[AW_SETPOINT].active ? " pending" : "") + "'>" + String(g_awaited[AW_SETPOINT].active ? g_awaited[AW_SETPOINT].target : s.setpoint) + "&deg;C</b> " + linkButton("+1", setHref("spd=1"), false);
     h += "<form action='/set' style='margin-top:6px'>Set: <input type=number name=sp min=" + String(s.setpointMin) + " max=" + String(s.setpointMax) +
          " value=" + String(s.setpoint) + "> <button class=b>Apply</button> <span class=dim>(" + String(s.setpointMin) + "&ndash;" + String(s.setpointMax) + ")</span></form>";
   } else h += "<p class=dim>Only available while the heater is on (the fireplace starts at 21&deg;C).</p>";
@@ -1097,14 +1350,14 @@ static String buildSettingsLive(const SharedState &s) {
   bool ready = s.ready && s.valid;
   int level = s.flameLevel < 1 ? 1 : s.flameLevel;
   String h;
-  h += "<h3>Flame level</h3>" + linkButtonRow("flame", ready ? level : -1, 1, 6, "F");
+  h += "<h3>Flame level</h3>" + linkButtonRow("flame", AW_FLAME_LEVEL, ready ? level : -1, 1, 6, "F");
 
   h += "<h3>Heater power</h3>";
-  h += linkButton("Low (0.9 kW)", setHref("hpwr=low"), ready && s.regHeaterPower == 0x01) + linkButton("High (1.8 kW)", setHref("hpwr=high"), ready && s.regHeaterPower == 0x03);
+  h += choiceButton("Low (0.9 kW)", setHref("hpwr=low"), ready && s.regHeaterPower == 0x01, AW_HEATER_POWER, 0) + choiceButton("High (1.8 kW)", setHref("hpwr=high"), ready && s.regHeaterPower == 0x03, AW_HEATER_POWER, 1);
   h += "<p class=dim>Can only be changed while the heater is on. The fireplace remembers the setting.</p>";
   if (ready && s.regHeaterPower != 0x01 && s.regHeaterPower != 0x03) h += "<p class=dim>Register 0x0048 = " + String(s.regHeaterPower, HEX) + "</p>";
 
-  h += "<h3>Volume</h3>" + linkButtonRow("vol", ready ? s.volume : -1, 0, 6);
+  h += "<h3>Volume</h3>" + linkButtonRow("vol", AW_VOLUME, ready ? s.volume : -1, 0, 6);
   h += "<p class=dim>Only for models with a sound effect; has no effect on fireplaces without sound.</p>";
 
   h += "<h3>Fireplace</h3><p class=dim>Selected: <b>" + String(s.configuredAddress[0] ? s.configuredAddress : "auto-detect") + "</b> &middot; passkey " + htmlEscape(s.passkeyText);
@@ -1179,6 +1432,7 @@ static String buildLiveHtml(const char *page) {
   copySnapshot(g_webSnapshot);
   const SharedState &s = g_webSnapshot;
   uint32_t pending = pendingCommands();
+  updateAwaited(s, pending);
   String h = buildLiveHeader(s, pending);
   if (page == PAGE_SETTINGS)   h += buildSettingsLive(s);
   else if (page == PAGE_DEBUG) h += buildDebugLive(s, pending);
@@ -1194,6 +1448,7 @@ static const char *pageFromName(const String &name) {
 
 // Send a complete page: menu, live block, `afterLive` (static content such as forms) and the refresh script.
 static void sendPage(const char *page, const String &afterLive) {
+  char step[STEP_TEXT_LENGTH]; snprintf(step, sizeof(step), "page: %s", page); setWebStep(step);
   String live = buildLiveHtml(page);
   auto navLink = [&](const char *target, const char *href, const char *label) { return String("<a class='nav") + (page == target ? " on" : "") + "' href='" + href + "'>" + label + "</a>"; };
   String h = "<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -1201,7 +1456,7 @@ static void sendPage(const char *page, const String &afterLive) {
              "<title>Dimplex Control</title><style>body{font-family:sans-serif;max-width:520px;margin:18px auto;"
              "padding:0 12px;color:#222}h2{color:#e25822;margin:0 0 8px}h3{margin:16px 0 4px}.b{display:inline-block;min-width:34px;text-align:center;"
              "padding:10px 12px;margin:3px;background:#eee;border-radius:8px;text-decoration:none;color:#222;border:0;font-size:100%}"
-             ".b.on{background:#e25822;color:#fff}.b.warn{background:#c0392b;color:#fff}.msg{background:#fff3cd;padding:8px;border-radius:6px}"
+             ".b.on{background:#2e9e4f;color:#fff}.b.off,.b.warn{background:#c0392b;color:#fff}.b.wait{background:#e68a00;color:#fff}.pending{color:#e68a00}.msg{background:#fff3cd;padding:8px;border-radius:6px}"
              ".nav{display:inline-block;padding:8px 14px;margin-right:4px;border-radius:8px 8px 0 0;background:#eee;text-decoration:none;color:#222}"
              ".nav.on{background:#e25822;color:#fff}nav{border-bottom:3px solid #e25822;margin-bottom:8px}"
              ".big{font-size:230%;font-weight:bold}table{border-collapse:collapse}td,th{padding:2px 8px;text-align:left}"
@@ -1232,7 +1487,29 @@ static void handleSettingsPage() {
   sendPage(PAGE_SETTINGS, form);
 }
 // Debug page.
-static void handleDebugPage() { sendPage(PAGE_DEBUG, ""); }
+// Debug page: the live block plus the static "Last restart" section (why the bridge started, what the previous session
+// was doing and its last log lines).
+static void handleDebugPage() {
+  String h = "<h3>Last restart</h3><p class=dim>Start #" + String((unsigned long) g_bootCount) + " &middot; reason: <b>" + htmlEscape(g_restartReason) + "</b></p>";
+  if (g_previousLogValid) {
+    h += "<p class=dim>The previous session was last doing: Bluetooth: <i>" + htmlEscape(g_previousBleStep) + "</i> &middot; MQTT: <i>" + htmlEscape(g_previousMqttStep) +
+         "</i> &middot; web: <i>" + htmlEscape(g_previousWebStep) + "</i></p>"
+         "<details><summary>Last log lines of the previous session</summary><pre style='font-size:80%;white-space:pre-wrap'>" + htmlEscape(g_previousLog) + "</pre></details>";
+  } else h += "<p class=dim>No log of a previous session (power was off, or this is the first start).</p>";
+  h += "<p class=dim><a href='/log'>Full log: previous and current session (text)</a></p>";
+  sendPage(PAGE_DEBUG, h);
+}
+// The restart-proof log as plain text: the previous session first, then the latest lines of this one.
+static void handleLog() {
+  setWebStep("log");
+  char current[LOG_RING_LINES * (LOG_RING_LINE_LENGTH + 1) + 1];
+  xSemaphoreTake(g_logMutex, portMAX_DELAY); joinRingLines(g_rtcLog, current, sizeof(current)); xSemaphoreGive(g_logMutex);
+  String out = String("Start #") + String((unsigned long) g_bootCount) + ", reason: " + g_restartReason + "\n\n=== previous session (last lines";
+  out += g_previousLogValid ? String("), last steps: BLE: ") + g_previousBleStep + " / MQTT: " + g_previousMqttStep + " / web: " + g_previousWebStep + " ===\n" + g_previousLog
+                            : String(") ===\n(none)\n");
+  out += String("\n=== this session (last lines) ===\n") + current;
+  g_webServer.send(200, "text/plain", out);
+}
 // Confirmation page for the factory reset (nothing is erased until the red button is pressed).
 static void handleResetPage() {
   g_webServer.send(200, "text/html",
@@ -1244,12 +1521,14 @@ static void handleResetPage() {
 }
 // Serve only the live block of one page (fetched by the page script).
 static void handleLive() {
+  setWebStep("live block");
   g_webServer.sendHeader("Cache-Control", "no-store");
   g_webServer.send(200, "text/html", buildLiveHtml(pageFromName(g_webServer.arg("p"))));
 }
 // Serve the complete status log as text, oldest first; one row per change (or per minute).
 // With ?download=1 the browser saves it as a file.
 static void handleCsv() {
+  setWebStep("csv");
   copySnapshot(g_webSnapshot);
   const SharedState &s = g_webSnapshot;
   String out = "uptime_s;time;temp_c;temp_raw;effect;heater;heater_power;setpoint_c;flame_level;reg0040;reg0014;reg003c\n";
@@ -1270,17 +1549,25 @@ static void handleCsv() {
 // Handle a button press or form: only parse the request and queue the command(s), then redirect back to the page
 // it came from (argument r). The result appears in the live block once the BLE task has finished.
 static void handleSet() {
+  setWebStep("set (button or form)");
   bool queued = true;
   String back = g_webServer.arg("r");
   if (g_webServer.hasArg("diag")) { g_loopGapMaxUs = 0; g_webRequestMaxUs = 0; setWebMessage("Timing maxima reset"); }
-  if (g_webServer.hasArg("ble"))    queued &= queueCommand(g_webServer.arg("ble") == "off" ? CMD_BLE_RELEASE : CMD_BLE_RESUME, 0, SOURCE_WEB);
-  if (g_webServer.hasArg("fx"))     queued &= queueCommand(CMD_FLAME_EFFECT, g_webServer.arg("fx") == "on", SOURCE_WEB);
-  if (g_webServer.hasArg("heater")) queued &= queueCommand(CMD_HEATER, g_webServer.arg("heater") == "on", SOURCE_WEB);
-  if (g_webServer.hasArg("hpwr"))   queued &= queueCommand(CMD_HEATER_POWER, g_webServer.arg("hpwr") == "high", SOURCE_WEB);
-  if (g_webServer.hasArg("sp"))     queued &= queueCommand(CMD_SETPOINT, g_webServer.arg("sp").toInt(), SOURCE_WEB);
-  if (g_webServer.hasArg("spd"))    queued &= queueCommand(CMD_SETPOINT_DELTA, g_webServer.arg("spd").toInt(), SOURCE_WEB);
-  if (g_webServer.hasArg("flame")) { int n = g_webServer.arg("flame").toInt(); n = n < 1 ? 1 : (n > 6 ? 6 : n); queued &= queueCommand(CMD_FLAME_LEVEL, n, SOURCE_WEB); }
-  if (g_webServer.hasArg("vol"))   { int n = g_webServer.arg("vol").toInt();   n = n < 0 ? 0 : (n > 6 ? 6 : n); queued &= queueCommand(CMD_VOLUME, n, SOURCE_WEB); }
+  // queueCommand() returns false when the queue is full; only a queued request is shown as "waiting" (orange button).
+  auto request = [&](CommandType type, int argument, AwaitedControl control, int target) {
+    bool ok = queueCommand(type, argument, SOURCE_WEB);
+    if (ok) awaitControl(control, target); else queued = false;
+  };
+  const SharedState &now = g_webSnapshot;               // last state shown to the page (for the +/- setpoint buttons)
+  auto clampSetpoint = [&](int degrees) { return degrees < now.setpointMin ? now.setpointMin : (degrees > now.setpointMax ? now.setpointMax : degrees); };
+  if (g_webServer.hasArg("ble"))    { bool on = g_webServer.arg("ble") != "off"; request(on ? CMD_BLE_RESUME : CMD_BLE_RELEASE, 0, AW_BLE, on); }
+  if (g_webServer.hasArg("fx"))     { bool on = g_webServer.arg("fx") == "on"; request(CMD_FLAME_EFFECT, on, AW_EFFECT, on); }
+  if (g_webServer.hasArg("heater")) { bool on = g_webServer.arg("heater") == "on"; request(CMD_HEATER, on, AW_HEATER, on); }
+  if (g_webServer.hasArg("hpwr"))   { bool high = g_webServer.arg("hpwr") == "high"; request(CMD_HEATER_POWER, high, AW_HEATER_POWER, high); }
+  if (g_webServer.hasArg("sp"))     { int degrees = g_webServer.arg("sp").toInt(); request(CMD_SETPOINT, degrees, AW_SETPOINT, clampSetpoint(degrees)); }
+  if (g_webServer.hasArg("spd"))    { int delta = g_webServer.arg("spd").toInt(); request(CMD_SETPOINT_DELTA, delta, AW_SETPOINT, clampSetpoint((g_awaited[AW_SETPOINT].active ? g_awaited[AW_SETPOINT].target : now.setpoint) + delta)); }
+  if (g_webServer.hasArg("flame"))  { int n = g_webServer.arg("flame").toInt(); n = n < 1 ? 1 : (n > 6 ? 6 : n); request(CMD_FLAME_LEVEL, n, AW_FLAME_LEVEL, n); }
+  if (g_webServer.hasArg("vol"))    { int n = g_webServer.arg("vol").toInt();   n = n < 0 ? 0 : (n > 6 ? 6 : n); request(CMD_VOLUME, n, AW_VOLUME, n); }
   if (g_webServer.hasArg("scan"))   queued &= queueCommand(CMD_SCAN, 0, SOURCE_WEB);
   if (g_webServer.hasArg("fpaddr") || g_webServer.hasArg("pkey")) {            // fireplace selection: the BLE task validates and applies it
     String address = g_webServer.arg("fpaddr"); address.trim(); if (address == "auto") address = "";
@@ -1298,7 +1585,7 @@ static void handleSet() {
   if (g_webServer.hasArg("restart")) {
     g_webServer.send(200, "text/html", "<!DOCTYPE html><html><body style='font-family:sans-serif;max-width:520px;margin:18px auto;padding:0 12px'>"
                      "<h2>Restarting&hellip;</h2><p>Reload <a href='/'>the page</a> in about 10 seconds.</p></body></html>");
-    delay(300); ESP.restart(); return;
+    delay(300); restartDevice("restart button"); return;
   }
   if (!queued) setWebMessage("Busy: too many commands waiting, try again in a moment");
   g_webServer.sendHeader("Location", back == "settings" ? "/settings" : (back == "debug" ? "/debug" : "/")); g_webServer.send(303);
@@ -1306,7 +1593,7 @@ static void handleSet() {
 // Register the page handlers and start the web server.
 static void startWebServer() {
   g_webServer.on("/", handleMainPage); g_webServer.on("/settings", handleSettingsPage); g_webServer.on("/debug", handleDebugPage);
-  g_webServer.on("/reset", handleResetPage); g_webServer.on("/live", handleLive); g_webServer.on("/set", handleSet); g_webServer.on("/csv", handleCsv);
+  g_webServer.on("/reset", handleResetPage); g_webServer.on("/live", handleLive); g_webServer.on("/set", handleSet); g_webServer.on("/csv", handleCsv); g_webServer.on("/log", handleLog);
   g_webServer.begin(); g_webStarted = true;
 }
 
@@ -1367,8 +1654,8 @@ static void runSetupPortal(bool forced) {
   param_fireplaceAddress.setValue(cfg_fireplaceAddress, 19); param_passkey.setValue(cfg_passkeyText, 11);
   // scan for nearby fireplaces to fill the picker, but only when the portal will show (avoids delaying normal boots)
   if (forced || !g_wifiManager.getWiFiIsSaved()) buildPortalScanList();
-  Serial.println(forced ? "[cfg] opening setup portal (join WiFi 'Dimplex-Setup' / pass 'dimplex123')"
-                        : "[wifi] connecting to saved network (opens 'Dimplex-Setup' portal only if none saved / connect fails)");
+  if (forced) logLine("cfg", "opening setup portal (join WiFi 'Dimplex-Setup' / pass 'dimplex123')");
+  else        logLine("wifi", "connecting to saved network (opens 'Dimplex-Setup' portal only if none saved / connect fails)");
   g_portalOpen = forced || !g_wifiManager.getWiFiIsSaved();         // for the LED; autoConnect only opens the portal when it has to
   if (forced) g_wifiManager.startConfigPortal("Dimplex-Setup", "dimplex123");
   else        g_wifiManager.autoConnect("Dimplex-Setup", "dimplex123");
@@ -1382,14 +1669,17 @@ static void runSetupPortal(bool forced) {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.printf("\nDimplex MQTT bridge (NimBLE + config portal, task layout) starting...\n");
+  Serial.println();
+  startDiagnosticsSession();               // saves the previous session's log and starts a new one (before the first log line)
+  logLine("boot", "Dimplex Control bridge (NimBLE + setup portal, task layout) starting...");
+  logLine("boot", "start #%lu, reason: %s", (unsigned long) g_bootCount, g_restartReason);
 
   g_commandQueue = xQueueCreate(8, sizeof(Command));
   g_snapshotMutex = xSemaphoreCreateMutex();
   startLeds();
 
   loadSettings();
-  Serial.printf("[%lu ms] [cfg] mqtt host=%s port=%s user=%s\n", millis(), cfg_mqttHost, cfg_mqttPort, cfg_mqttUser);
+  logLine("cfg", "mqtt host=%s port=%s user=%s", cfg_mqttHost, cfg_mqttPort, cfg_mqttUser);
 
   NimBLEDevice::init("dimplex-control");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
@@ -1425,8 +1715,7 @@ void loop() {
       MDNS.begin("dimplex-control");
       MDNS.addService("http", "tcp", 80);
       startWebServer();
-      Serial.printf("[%lu ms] [web] control UI at http://dimplex-control.local/  (or http://%s/)\n",
-                    millis(), WiFi.localIP().toString().c_str());
+      logLine("web", "control UI at http://dimplex-control.local/  (or http://%s/)", WiFi.localIP().toString().c_str());
       lastPassUs = 0; g_loopGapMaxUs = 0;     // do not count the one-time start-up work
     }
     uint32_t startUs = micros();

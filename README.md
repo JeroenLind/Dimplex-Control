@@ -55,10 +55,10 @@ The temperature the fireplace reports comes from a sensor **inside the fireplace
 
 ## Documentation
 
-- [`register-map.md`](register-map.md): the GATT registers of the fireplace, with a confidence level per register.
-- [`experiments.md`](experiments.md): how the registers were found (dumps, comparisons, measurements).
-- [`task-architecture.md`](task-architecture.md): how the firmware is organised (tasks, queue, snapshot).
-- [`CHANGES.md`](CHANGES.md): notable changes.
+- [`design.md`](docs/design.md): the design of the project: external interfaces (Bluetooth, Wi-Fi, MQTT, web), program structure, key flows and design decisions.
+- [`register-map.md`](docs/register-map.md): the GATT registers of the fireplace, with a confidence level per register.
+- [`experiments.md`](docs/experiments.md): how the registers were found (dumps, comparisons, measurements).
+- [`task-architecture.md`](docs/task-architecture.md): how the task layout was reviewed and specified (history; `design.md` describes the current state).
 
 ## Credits
 
