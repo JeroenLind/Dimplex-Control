@@ -52,6 +52,7 @@
 #include <stdarg.h>
 #include <esp_system.h>      // esp_reset_reason()
 #include <esp_timer.h>       // esp_timer_get_time()
+#include "icons.h"           // app icons for "install on the phone" (second tab in the Arduino IDE)
 
 // =====================================================================================================
 // 1. SETTINGS
@@ -86,6 +87,12 @@ static char cfg_mqttPassword[40] = "dimplex";
 #define MESSAGE_SHOW_TIME_MS         8000     // how long a result message stays on the web page
 #define PAGE_REFRESH_MS              3000     // live block refresh interval
 #define PAGE_REFRESH_BUSY_MS         1000     // ... while commands are running or the link is connecting
+// Wi-Fi watchdog (see checkWifiConnection): what to do when the Wi-Fi connection stays away
+#ifndef WIFI_RECONNECT_AFTER_MS
+#define WIFI_RECONNECT_AFTER_MS      30000    // Wi-Fi down this long: ask for a new connection, then again every 30 s
+#define WIFI_FULL_RECONNECT_AFTER_MS 300000   // ... 5 minutes: drop the connection and start again with the saved network
+#define WIFI_RESTART_AFTER_MS        600000   // ... 10 minutes: restart the bridge
+#endif
 
 Preferences g_prefs;
 WiFiManager g_wifiManager;
@@ -170,6 +177,7 @@ static volatile uint32_t g_loopGapMaxUs = 0, g_webRequestMaxUs = 0, g_mqttFailCo
 static volatile uint32_t g_bleStackFree = 0, g_mqttStackFree = 0;
 static volatile bool g_mqttUp = false;
 static volatile bool g_portalOpen = false;         // the 'Dimplex-Setup' portal is open (for the LED)
+static volatile uint32_t g_wifiDrops = 0, g_wifiLastOutageSeconds = 0;   // Wi-Fi outages since the start, duration of the last one (loop() writes)
 
 // NOTE for the Arduino IDE: it inserts automatic function prototypes before the FIRST function in this file. All types
 // (struct / enum) must therefore be defined above the first function, otherwise the build fails with "does not name a type".
@@ -1021,6 +1029,8 @@ static void publishDiagnosticDiscovery() {
   publishDiagnosticSensor("diag_free_heap", "Free memory", "free_heap", "\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ic\":\"mdi:memory\"");
   publishDiagnosticSensor("diag_min_heap", "Lowest free memory", "min_heap", "\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ic\":\"mdi:memory\"");
   publishDiagnosticSensor("diag_wifi", "Wi-Fi signal", "wifi_rssi", "\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"stat_cla\":\"measurement\"");
+  publishDiagnosticSensor("diag_wifi_drops", "Wi-Fi drops", "wifi_drops", "\"stat_cla\":\"total_increasing\",\"ic\":\"mdi:wifi-off\"");
+  publishDiagnosticSensor("diag_wifi_outage", "Last Wi-Fi outage", "wifi_last_outage", "\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\",\"stat_cla\":\"measurement\",\"ic\":\"mdi:wifi-off\"");
   publishDiagnosticSensor("diag_ble_connects", "Bluetooth connections", "ble_connects", "\"stat_cla\":\"total_increasing\",\"ic\":\"mdi:bluetooth-connect\"");
   publishDiagnosticSensor("diag_mqtt_failures", "MQTT connect failures", "mqtt_failures", "\"stat_cla\":\"total_increasing\",\"ic\":\"mdi:lan-disconnect\"");
   publishDiagnosticSensor("diag_stack_ble", "Free stack BLE task", "stack_ble", "\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ic\":\"mdi:memory\"");
@@ -1165,13 +1175,13 @@ static void publishChanges(const SharedState &s) {
 
 // Publish the health values as one JSON message (retained). Called after connecting and then every 60 s.
 static void publishDiagnostics() {
-  char json[420];
+  char json[480];
   snprintf(json, sizeof(json),
            "{\"restart_reason\":\"%s\",\"restart_count\":%lu,\"uptime\":%lu,\"free_heap\":%lu,\"min_heap\":%lu,\"wifi_rssi\":%d,"
-           "\"ble_connects\":%lu,\"mqtt_failures\":%lu,\"stack_ble\":%lu,\"stack_mqtt\":%lu}",
+           "\"ble_connects\":%lu,\"mqtt_failures\":%lu,\"stack_ble\":%lu,\"stack_mqtt\":%lu,\"wifi_drops\":%lu,\"wifi_last_outage\":%lu}",
            g_restartReason, (unsigned long) g_bootCount, (unsigned long) (esp_timer_get_time() / 1000000ULL), (unsigned long) ESP.getFreeHeap(),
            (unsigned long) ESP.getMinFreeHeap(), (int) WiFi.RSSI(), (unsigned long) g_bleReadyCount, (unsigned long) g_mqttFailCount,
-           (unsigned long) g_bleStackFree, (unsigned long) g_mqttStackFree);
+           (unsigned long) g_bleStackFree, (unsigned long) g_mqttStackFree, (unsigned long) g_wifiDrops, (unsigned long) g_wifiLastOutageSeconds);
   g_mqttClient.publish(TOPIC_DIAG_STATE, json, true);
   g_diagnosticsDue = false; g_lastDiagnosticsMs = millis();
 }
@@ -1320,7 +1330,13 @@ static String buildMainLive(const SharedState &s) {
   bool ready = s.ready && s.valid;
   bool effectOn = ready && isFlameEffectOn(s), heaterOn = ready && isHeaterOn(s);
   String h;
-  h += "<h3>Bluetooth</h3>" + choiceButton("Connected", setHref("ble=on"), s.bleEnabled, AW_BLE, 1) + choiceButton("Released (use remote)", setHref("ble=off"), !s.bleEnabled, AW_BLE, 0);
+  // "Connected" is green only when the link is really up; while the bridge is still connecting it is orange, like any other
+  // switch that is on its way (the fireplace can be slow or far away).
+  bool connecting = s.bleEnabled && !s.ready;
+  String connectedButton = connecting && !g_awaited[AW_BLE].active
+                         ? "<a class='b wait' href='" + setHref("ble=on") + "'>Connected</a> "
+                         : choiceButton("Connected", setHref("ble=on"), s.bleEnabled, AW_BLE, 1);
+  h += "<h3>Bluetooth</h3>" + connectedButton + choiceButton("Released (use remote)", setHref("ble=off"), !s.bleEnabled, AW_BLE, 0);
   h += "<p class=dim>";
   if (!s.bleEnabled)  h += "Released: the original remote can connect. Values below are the last known.";
   else if (s.ready)   h += "Connected and paired to the fireplace.";
@@ -1453,6 +1469,11 @@ static void sendPage(const char *page, const String &afterLive) {
   auto navLink = [&](const char *target, const char *href, const char *label) { return String("<a class='nav") + (page == target ? " on" : "") + "' href='" + href + "'>" + label + "</a>"; };
   String h = "<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
              "<noscript><meta http-equiv=refresh content=5></noscript>"
+             // "Install as an app": web app manifest (Android/Chrome) and the Apple tags (iPhone: Safari and Chrome, Add to Home Screen)
+             "<link rel=manifest href=/manifest.webmanifest><meta name=theme-color content='#e25822'>"
+             "<meta name=mobile-web-app-capable content=yes><meta name=apple-mobile-web-app-capable content=yes>"
+             "<meta name=apple-mobile-web-app-title content=Dimplex><meta name=apple-mobile-web-app-status-bar-style content=default>"
+             "<link rel=apple-touch-icon href=/icon-192.png><link rel=icon type=image/png href=/icon-192.png>"
              "<title>Dimplex Control</title><style>body{font-family:sans-serif;max-width:520px;margin:18px auto;"
              "padding:0 12px;color:#222}h2{color:#e25822;margin:0 0 8px}h3{margin:16px 0 4px}.b{display:inline-block;min-width:34px;text-align:center;"
              "padding:10px 12px;margin:3px;background:#eee;border-radius:8px;text-decoration:none;color:#222;border:0;font-size:100%}"
@@ -1468,7 +1489,8 @@ static void sendPage(const char *page, const String &afterLive) {
        "var a=document.activeElement;if(!(a&&a.tagName=='INPUT'))box.innerHTML=t;"
        "setTimeout(tick,t.indexOf('data-busy')>=0?" + String(PAGE_REFRESH_BUSY_MS) + ":" + String(PAGE_REFRESH_MS) + ");"
        "}).catch(function(){setTimeout(tick,5000)});}"
-       "setTimeout(tick," + String(PAGE_REFRESH_MS) + ");</script></body></html>";
+       "setTimeout(tick," + String(PAGE_REFRESH_MS) + ");"
+       "if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(function(){});</script></body></html>";
   g_webServer.send(200, "text/html", h);
 }
 
@@ -1590,10 +1612,40 @@ static void handleSet() {
   if (!queued) setWebMessage("Busy: too many commands waiting, try again in a moment");
   g_webServer.sendHeader("Location", back == "settings" ? "/settings" : (back == "debug" ? "/debug" : "/")); g_webServer.send(303);
 }
+// ---- install as an app (PWA) ----
+// The manifest tells the phone how to show the page as an app: name, icon, colour, no browser bar. The service worker does
+// nothing except existing (Chrome wants one before it offers "Install app"); it caches nothing, so the page is always live.
+// Chrome on Android only offers "Install app" on a secure origin (HTTPS, or localhost); see README for the options.
+static const char APP_MANIFEST[] PROGMEM = R"JSON({
+"id":"/","name":"Dimplex Control","short_name":"Dimplex","description":"Control the Dimplex fireplace",
+"start_url":"/","scope":"/","display":"standalone","orientation":"portrait",
+"background_color":"#ffffff","theme_color":"#e25822",
+"icons":[
+{"src":"/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},
+{"src":"/icon-192.png","sizes":"192x192","type":"image/png","purpose":"maskable"},
+{"src":"/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any"},
+{"src":"/icon-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}]
+})JSON";
+static const char APP_SERVICE_WORKER[] PROGMEM =
+  "self.addEventListener('install',function(){self.skipWaiting()});"
+  "self.addEventListener('activate',function(e){e.waitUntil(self.clients.claim())});"
+  "self.addEventListener('fetch',function(){});";
+// Serve a file from flash that rarely changes; the phone may keep it for a day.
+static void sendStaticFile(const char *contentType, const char *data, size_t length) {
+  g_webServer.sendHeader("Cache-Control", "max-age=86400");
+  g_webServer.send_P(200, contentType, data, length);
+}
+static void handleManifest()      { sendStaticFile("application/manifest+json", APP_MANIFEST, sizeof(APP_MANIFEST) - 1); }
+static void handleServiceWorker() { sendStaticFile("application/javascript", APP_SERVICE_WORKER, sizeof(APP_SERVICE_WORKER) - 1); }
+static void handleIcon192()       { sendStaticFile("image/png", (const char *) ICON_192_PNG, ICON_192_PNG_SIZE); }
+static void handleIcon512()       { sendStaticFile("image/png", (const char *) ICON_512_PNG, ICON_512_PNG_SIZE); }
+
 // Register the page handlers and start the web server.
 static void startWebServer() {
   g_webServer.on("/", handleMainPage); g_webServer.on("/settings", handleSettingsPage); g_webServer.on("/debug", handleDebugPage);
   g_webServer.on("/reset", handleResetPage); g_webServer.on("/live", handleLive); g_webServer.on("/set", handleSet); g_webServer.on("/csv", handleCsv); g_webServer.on("/log", handleLog);
+  g_webServer.on("/manifest.webmanifest", handleManifest); g_webServer.on("/sw.js", handleServiceWorker);
+  g_webServer.on("/icon-192.png", handleIcon192); g_webServer.on("/icon-512.png", handleIcon512);
   g_webServer.begin(); g_webStarted = true;
 }
 
@@ -1693,10 +1745,50 @@ void setup() {
 
   runSetupPortal(false);
 
+  WiFi.setAutoReconnect(true);             // explicit; checkWifiConnection() is the safety net when it does not work
   publishSnapshot();                       // initial snapshot (nothing connected yet)
   // Both worker tasks run on core 0 below the Wi-Fi/BT system tasks; loop() (web) keeps core 1 to itself.
   xTaskCreatePinnedToCore(bleTask,  "ble",  8192, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(mqttTask, "mqtt", 8192, nullptr, 1, nullptr, 0);
+}
+
+// Wi-Fi watchdog, called on every pass of loop(). The ESP32 reconnects by itself after a short outage, but not always (for
+// example when the router or mesh was still starting and refused the first attempt). So: when Wi-Fi is down for
+// WIFI_RECONNECT_AFTER_MS, ask for a new connection every 30 s; after WIFI_FULL_RECONNECT_AFTER_MS start again from the
+// saved network; after WIFI_RESTART_AFTER_MS restart the bridge. The outages are counted and shown in Home Assistant.
+static void checkWifiConnection() {
+  static bool wasUp = true;
+  static uint32_t downSinceMs = 0, lastActionMs = 0;
+  static bool fullReconnectDone = false;
+  bool up = WiFi.status() == WL_CONNECTED;
+  uint32_t now = millis();
+  if (up) {
+    if (!wasUp) {
+      g_wifiLastOutageSeconds = (now - downSinceMs) / 1000;
+      logLine("wifi", "connection restored after %lu s (IP %s)", (unsigned long) g_wifiLastOutageSeconds, WiFi.localIP().toString().c_str());
+      wasUp = true; fullReconnectDone = false;
+    }
+    return;
+  }
+  if (wasUp) {                                       // the connection has just been lost
+    wasUp = false; downSinceMs = lastActionMs = now; fullReconnectDone = false;
+    g_wifiDrops = g_wifiDrops + 1;
+    logLine("wifi", "connection lost");
+    return;
+  }
+  uint32_t downMs = now - downSinceMs;
+  if (downMs > WIFI_RESTART_AFTER_MS) { restartDevice("Wi-Fi down for 10 minutes"); downSinceMs = now; return; }
+  if (downMs > WIFI_FULL_RECONNECT_AFTER_MS && !fullReconnectDone) {
+    fullReconnectDone = true; lastActionMs = now;
+    logLine("wifi", "still down after %lu s: starting again with the saved network", (unsigned long) (downMs / 1000));
+    WiFi.disconnect(); WiFi.begin();
+    return;
+  }
+  if (downMs > WIFI_RECONNECT_AFTER_MS && now - lastActionMs > WIFI_RECONNECT_AFTER_MS) {      // first after the delay, then repeated at the same interval
+    lastActionMs = now;
+    logLine("wifi", "still down after %lu s: asking for a new connection", (unsigned long) (downMs / 1000));
+    WiFi.reconnect();
+  }
 }
 
 // Main loop (core 1): starts NTP, mDNS and the web server once Wi-Fi is up, then only serves web requests.
@@ -1706,6 +1798,7 @@ void loop() {
   uint32_t nowUs = micros();
   if (lastPassUs && nowUs - lastPassUs > g_loopGapMaxUs) g_loopGapMaxUs = nowUs - lastPassUs;
   lastPassUs = nowUs;
+  checkWifiConnection();
   if (WiFi.status() == WL_CONNECTED) {
     if (!g_ntpStarted) {            // Dutch time zone incl. summer time; change the TZ string if you live elsewhere
       configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");

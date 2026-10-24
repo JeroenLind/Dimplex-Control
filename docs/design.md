@@ -135,7 +135,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | Heater power | sensor | `dimplex_heater_power` |
 | Internal temperature | sensor | `dimplex_temperature` |
 | Raw registers | sensor (diagnostic) | `dimplex_raw` |
-| Last restart reason, Restart count, Uptime, Free memory, Lowest free memory, Wi-Fi signal, Bluetooth connections, MQTT connect failures, Free stack BLE task, Free stack MQTT task | sensors (diagnostic), all read from `dimplex/diag/state` | `dimplex_diag_restart_reason`, `dimplex_diag_restart_count`, `dimplex_diag_uptime`, `dimplex_diag_free_heap`, `dimplex_diag_min_heap`, `dimplex_diag_wifi`, `dimplex_diag_ble_connects`, `dimplex_diag_mqtt_failures`, `dimplex_diag_stack_ble`, `dimplex_diag_stack_mqtt` |
+| Last restart reason, Restart count, Uptime, Free memory, Lowest free memory, Wi-Fi signal, Wi-Fi drops, Last Wi-Fi outage, Bluetooth connections, MQTT connect failures, Free stack BLE task, Free stack MQTT task | sensors (diagnostic), all read from `dimplex/diag/state` | `dimplex_diag_restart_reason`, `dimplex_diag_restart_count`, `dimplex_diag_uptime`, `dimplex_diag_free_heap`, `dimplex_diag_min_heap`, `dimplex_diag_wifi`, `dimplex_diag_wifi_drops`, `dimplex_diag_wifi_outage`, `dimplex_diag_ble_connects`, `dimplex_diag_mqtt_failures`, `dimplex_diag_stack_ble`, `dimplex_diag_stack_mqtt` |
 
 Entities that existed in older versions (water sensor, volume, the read-only heater and setpoint sensors) are removed on connect by publishing an empty retained config.
 
@@ -154,11 +154,19 @@ Served by the Arduino `WebServer` on port 80 from `loop()`.
 | `/set?...` | Actions. Parameters: `ble=on/off`, `fx=on/off`, `heater=on/off`, `hpwr=low/high`, `sp=<deg>`, `spd=<+/-1>`, `flame=1..6`, `vol=0..6`, `scan=1`, `fpaddr=<mac or auto>`, `pkey=<digits>`, `diag=reset`, `restart=1`, `factory=confirm`, plus `r=<page>` for the page to return to |
 | `/reset` | Confirmation page for the factory reset |
 | `/csv`, `/csv?download=1` | Status log as text or as a file (`dimplex-status-log.csv`) |
+| `/manifest.webmanifest`, `/sw.js`, `/icon-192.png`, `/icon-512.png` | Web app manifest, service worker and icons, so the page can be installed as an app (below) |
 | `/log` | The restart-proof log as text: the previous session (with its last steps) and the latest lines of this one |
 
 Every page is a fixed frame around one live block. A small script fetches `/live?p=<page>` every 3 s (every 1 s while commands are running or the link is connecting) and replaces the block. Forms sit outside the live block, so a refresh never clears what is being typed. Without JavaScript the page refreshes itself every 5 s.
 
 `/set` only parses the request, puts commands in the queue and answers `303` back to the page. The result appears in the live block once the BLE task has finished. Buttons show the progress: green is on (or the selected value), red is off, orange means the request has been sent and the fireplace has not confirmed it yet, grey is not selected.
+
+**Install as an app.** Every full page links a web app manifest (`/manifest.webmanifest`: name, short name, start URL, `standalone` display, theme colour, 192 and 512 px icons, also marked maskable), the Apple tags (`apple-mobile-web-app-capable`, title, status bar style, `apple-touch-icon`) and registers a service worker (`/sw.js`). The service worker only exists to satisfy Chrome's installability check: it has an empty fetch handler and caches nothing, so the page always shows live data. The icons (an orange square with a white flame, full bleed so they also work as maskable icons) are PNG arrays in `icons.h`, about 7 kB in flash. Files that never change are sent with `Cache-Control: max-age=86400`.
+
+What works where, checked with Chromium's installability check:
+- **iPhone (Safari, and Chrome on iOS 16.4 and newer):** "Add to Home Screen" works over plain HTTP, and the page then opens full screen.
+- **Android (Chrome):** "Install app" needs a secure origin. Over plain HTTP the browser reports `not-from-secure-origin` and no service worker can register (the page script checks for this and does nothing). With HTTPS, or with the Chrome flag *Insecure origins treated as secure* set for the bridge's address, the manifest, icons and service worker pass the check. The bridge itself does not serve HTTPS: a self-signed certificate is not accepted for installing, and a trusted one cannot be issued for a `.local` name. A reverse proxy with a real certificate (for example in Home Assistant) is the clean solution. See the README for the steps.
+- The app is only a window on the web page: it needs the local network and has no offline mode.
 
 ### 3.5 Serial log
 
@@ -214,6 +222,8 @@ One file, `Dimplex-Control.ino`, in numbered sections:
 | 7. Web pages | Page builders, button helpers, handlers |
 | 8. LEDs | `ledTask` |
 | 9. Setup | Setup portal, `setup()`, `loop()` |
+
+A second file, `icons.h`, in the same folder holds the app icons as PNG byte arrays.
 
 All types (`struct`, `enum`) are defined above the first function. The Arduino IDE inserts automatic function prototypes before the first function, so a type defined after it breaks the build with errors like "does not name a type".
 
@@ -288,6 +298,7 @@ Command types: flame effect, heater, heater power, setpoint, setpoint delta (the
 | temperature deadband | 0.2 °C | MQTT publication of the temperature |
 | echo hold | until the command is done, at most 8 s | MQTT echo |
 | button feedback | settle 2 s, give up 15 s | Orange buttons on the web page |
+| Wi-Fi watchdog | 30 s / 5 min / 10 min | New connection request (repeated every 30 s) / start again with the saved network / restart (`WIFI_RECONNECT_AFTER_MS`, `WIFI_FULL_RECONNECT_AFTER_MS`, `WIFI_RESTART_AFTER_MS`) |
 | status history | on change, otherwise once a minute, 120 rows | CSV log |
 
 ### 4.5 Memory
@@ -305,7 +316,7 @@ The bridge usually sits somewhere without a USB cable, so after a crash or reset
 | Restart-proof log | Every `logLine()` line is also stored in a ring of the last 30 lines in RTC memory (`RTC_NOINIT_ATTR`). That memory keeps its content over a crash, a watchdog reset and a software restart, but not over a power loss. A magic number at the start and the end of the structure tells whether the content is valid. A mutex protects the ring because several tasks write log lines. |
 | Last steps | Each task writes what it is doing now into RTC memory (`setBleStep`, `setMqttStep`, `setWebStep`): "connecting to the fireplace", "command: heater (1)", "publishing discovery", "page: debug" and so on. After a crash this shows in which step the task was, also when that step logged nothing yet. |
 | Previous session | At the start of `setup()`, `startDiagnosticsSession()` copies the ring and the steps into normal RAM, decides the restart reason, clears the ring for the new session and counts the start. The Debug page shows reason, count, last steps and the previous log lines; `/log` shows previous and current lines as plain text. |
-| Home Assistant | The reason, the count and other health values (uptime, free and lowest free memory, Wi-Fi signal, Bluetooth connections, MQTT failures, free stack of both tasks) are published as diagnostic sensors from one JSON message every 60 s. If the bridge dies, the availability topic turns the sensors to unavailable; after the restart the reason sensor tells why. A restart count that jumps, or an uptime that falls back to zero, is a good trigger for an automation. |
+| Home Assistant | The reason, the count and other health values (uptime, free and lowest free memory, Wi-Fi signal, Wi-Fi drops and the length of the last outage, Bluetooth connections, MQTT failures, free stack of both tasks) are published as diagnostic sensors from one JSON message every 60 s. If the bridge dies, the availability topic turns the sensors to unavailable; after the restart the reason sensor tells why. A restart count that jumps, or an uptime that falls back to zero, is a good trigger for an automation. |
 
 Limits: the ring only holds the last 30 lines (96 characters each), and nothing survives a power loss. A crash in the middle of writing a line can leave that last line incomplete. The log is not a crash dump: the register contents and the backtrace of a panic are not stored (see the reminders in section 11).
 
@@ -436,7 +447,7 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 
 | Situation | Behaviour |
 |---|---|
-| Wi-Fi lost | MQTT and web wait. BLE keeps running. The LED shows one flash. Wi-Fi reconnects through the normal stack. |
+| Wi-Fi lost | MQTT and web wait. BLE keeps running. The LED shows one flash. The ESP32 normally reconnects by itself, but not always (an authentication failure while the router or mesh is still starting is not retried). `checkWifiConnection()` in `loop()` is the safety net: after 30 s without Wi-Fi it asks for a new connection (repeated every 30 s); after 5 minutes it drops the connection and starts again with the saved network; after 10 minutes it restarts the bridge (restart reason "Software restart: Wi-Fi down for 10 minutes"). Outages and the duration of the last one are counted and shown in Home Assistant. |
 | Broker unreachable | The MQTT task retries with backoff (3 s up to 30 s) and looks up the broker address again after 3 failures. Web and BLE are not affected. On reconnect everything is republished. |
 | Fireplace out of range or off | The BLE task retries every 5 s. The page shows "Connecting". The snapshot keeps the last known values; MQTT keeps the last published values and shows `None` for setpoint and temperature only before the first reading after a restart. |
 | Remote holds the link | Connect attempts fail every 5 s until the remote disconnects. Releasing the bridge's link on purpose avoids this. |
@@ -465,7 +476,7 @@ Dimplex Control is meant for a trusted home network. Known limits:
 
 ## 10. Testing
 
-- **Simulation on a PC.** The sketch is compiled with `g++ -Wall -Wextra` against stub versions of the Arduino, WiFi, WebServer, NimBLE, PubSubClient and related headers, with a simulated fireplace (optionally slow to report changes), a simulated broker and a simulated web client. About 75 checks cover: command execution and ordering, the web pages and live block, button feedback, fireplace selection and validation, factory reset, MQTT discovery and commands, the echo without flicker against a fireplace that needs 1.5 s, the deadband, Bluetooth release and resume, the LED states, a broker that does not answer, a lost BLE link in the middle of a command, and the crash diagnostics (previous session log, restart reason, planned restart, health sensors).
+- **Simulation on a PC.** The sketch is compiled with `g++ -Wall -Wextra` against stub versions of the Arduino, WiFi, WebServer, NimBLE, PubSubClient and related headers, with a simulated fireplace (optionally slow to report changes), a simulated broker and a simulated web client. About 90 checks cover: command execution and ordering, the web pages and live block, button feedback, fireplace selection and validation, factory reset, MQTT discovery and commands, the echo without flicker against a fireplace that needs 1.5 s, the deadband, Bluetooth release and resume, the LED states, a broker that does not answer, a lost BLE link in the middle of a command, and the crash diagnostics (previous session log, restart reason, planned restart, health sensors) and the Wi-Fi watchdog (with shortened delays).
 - **Measured in the simulation:** the slowest web request stayed in the order of a few milliseconds while BLE and MQTT were blocked.
 - **Not tested:** the real ESP32, the real NimBLE and Wi-Fi coexistence timing, the stack sizes, Home Assistant itself, and long-term behaviour (heap over 24 hours). The first real test of each of those is on the hardware. The Debug page shows the numbers needed (loop gap, request time, free stack, free heap).
 - **Acceptance criteria** that were defined for the task layout (response time, no resets, no leaks, ordered commands, recovery) are in `task-architecture.md`, section 7.
@@ -484,6 +495,7 @@ Dimplex Control is meant for a trusted home network. Known limits:
 | Fixed delays | The 650 ms pause when starting the heater and the read-back timing are taken from the remote's behaviour and have not been tuned on real hardware. A measurement run using the log line `state confirmed after N ms` would show how much can be saved. |
 | Web feedback for MQTT commands | Only commands from the web page mark buttons as waiting. Commands from MQTT or the remote show only the "Working" line. |
 | Authentication | None on the web interface (section 9). |
+| HTTPS | The bridge serves plain HTTP only. Chrome on Android therefore needs a flag or a reverse proxy to install the app (section 3.4). |
 | Other ideas | Over-the-air updates (see the reminders below); a settings page for MQTT and time zone (now only in the portal and in the source); a second sensor reading for the room temperature; a program or timer function (the weekly timer registers are documented in `register-map.md` but not used). |
 
 ### Reminders: debugging in the field (not implemented yet)
@@ -504,7 +516,7 @@ The restart reason, restart count, restart-proof log and the health sensors (sec
 
 - **Board:** ESP32 Dev Module (a plain ESP32 has ample resources; an ESP32-S3 works too but needs other LED and pin choices).
 - **Libraries:** NimBLE-Arduino 2.x, PubSubClient 2.8 or newer (`setSocketTimeout`), WiFiManager; WiFi, WebServer, ESPmDNS and Preferences come with the ESP32 core.
-- **Sketch folder:** the folder must have the same name as the sketch (`Dimplex-Control/Dimplex-Control.ino`).
+- **Sketch folder:** the folder must have the same name as the sketch (`Dimplex-Control/Dimplex-Control.ino`) and also contain `icons.h` (the app icons; the Arduino IDE shows it as a second tab).
 - **First flash:** check the defaults at the top (fireplace address, passkey, MQTT credentials) and the time zone string in `loop()`.
 - **Adding code:** define new types above the first function, use `logLine()` for log output, call BLE only from `bleTask`, MQTT only from `mqttTask`, and let `loop()` only read snapshots and queue commands.
 

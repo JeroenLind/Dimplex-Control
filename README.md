@@ -13,6 +13,8 @@ Built and tested on a **Dimplex Engine 56/600** (Pro Range, ENG56-600, firmware 
   - **Debug:** CSV status log download, raw registers, temperature history, connection and system information.
 - **MQTT with Home Assistant auto-discovery:** switches for the fireplace, heater and Bluetooth link, numbers for flame level and setpoint, and sensors for heater power, internal temperature and raw registers.
 - **Responsive:** web, BLE and MQTT run in separate FreeRTOS tasks, so a slow broker or a fireplace that is out of range does not freeze the page.
+- **Installable as an app:** add the web interface to the home screen of an iPhone or Android phone so it opens full screen with its own icon (see below).
+- **Diagnostics:** the Debug page and Home Assistant show why the bridge last restarted, how many starts there have been and health values such as uptime, memory and Wi-Fi signal. The last log lines before a crash survive the restart.
 - **Status LED:** blink codes show Wi-Fi, MQTT and Bluetooth state (optional external LEDs per connection).
 - **Setup without re-flashing:** Wi-Fi, MQTT broker and fireplace are configured through a captive portal (`Dimplex-Setup`) and stored in flash.
 - The fireplace clock is set from NTP every time the bridge connects.
@@ -26,7 +28,7 @@ Built and tested on a **Dimplex Engine 56/600** (Pro Range, ENG56-600, firmware 
 
 ## Getting started
 
-1. Open `Dimplex_MQTT_v2.ino` and check the settings at the top: the time zone string in `loop()` (default is Central European Time), and the default fireplace address, passkey and MQTT credentials. You can also change these later in the setup portal.
+1. Open `Dimplex-Control/Dimplex-Control.ino` in the Arduino IDE (the folder also contains `icons.h`, which shows up as a second tab) and check the settings at the top: the time zone string in `loop()` (default is Central European Time), and the default fireplace address, passkey and MQTT credentials. You can also change these later in the setup portal.
 2. Flash the sketch to the ESP32.
 3. On first boot (or after a factory reset) the ESP32 opens the Wi-Fi network **Dimplex-Setup** (password `dimplex123`). Join it, choose your Wi-Fi network and enter the MQTT broker, the fireplace and the passkey. Leave the fireplace address empty to detect it automatically by its Bluetooth name (`FI####<Dimplex>`).
 4. Open `http://dimplex-control.local/` (or the IP address in the serial log).
@@ -35,6 +37,21 @@ Built and tested on a **Dimplex Engine 56/600** (Pro Range, ENG56-600, firmware 
 **The passkey is different for every fireplace.** You get it by sniffing the pairing between the original remote and the fireplace and cracking it. Lammerink's repository describes how.
 
 The fireplace accepts only **one Bluetooth connection at a time**. While the bridge is connected the original remote cannot connect: press *Released (use remote)* on the Main page (or switch off the *Bluetooth link* in Home Assistant) and the remote works again.
+
+## Install on your phone
+
+The web interface can be put on the home screen of a phone, so it opens like an app: full screen, without an address bar, with the flame icon. It is the same web page, so the phone has to be on the same Wi-Fi network as the bridge.
+
+**iPhone (Safari, or Chrome on iOS 16.4 and newer):** open `http://dimplex-control.local/`, tap the *Share* button and choose *Add to Home Screen*. This works over plain HTTP.
+
+**Android (Chrome):** Chrome offers *Install app* only for pages served over HTTPS, and the bridge serves plain HTTP. Two ways around that:
+
+1. *Allow it for this address* (simple, personal use): open `chrome://flags`, search for **Insecure origins treated as secure**, enter `http://dimplex-control.local` (or the bridge's IP address, exactly as you use it), set it to *Enabled* and restart Chrome. Then open the page and use the menu (three dots) → *Install app*.
+2. *Serve it over HTTPS:* put a reverse proxy with a trusted certificate in front of the bridge (for example the Nginx or Caddy add-on of Home Assistant, or Nabu Casa remote access) and install the app from that address.
+
+Without either, *Add to Home screen* in the Chrome menu still puts a shortcut with the icon on your home screen. Chrome may then open it as a normal browser tab instead of an app.
+
+If your phone cannot resolve `dimplex-control.local`, use the bridge's IP address instead (give it a fixed address in your router so it does not change).
 
 ## LED codes
 
