@@ -9,6 +9,9 @@
  *     registers, temperature history, CSV status log download, system info). Values refresh by themselves every 3 s.
  *   - MQTT with Home Assistant auto-discovery: fireplace (flame effect) switch, flame intensity, heater switch,
  *     setpoint number, Bluetooth link switch (release the link so the original remote can connect), plus read-only sensors (heater power, internal temperature, raw registers).
+ *   - Temperature control in the bridge (see thermostat.h): the bridge can regulate the heater itself, on a room temperature
+ *     that arrives over MQTT (dimplex/room_temperature/set) or on the sensor inside the fireplace, with hysteresis, a
+ *     fail-safe time-out for the room temperature and a setpoint that is saved in flash. The mode is chosen on the Main page.
  *   - Status LED(s): see "LED STATUS" below.
  *   - Volume (register 0x0076) is only offered on the Settings page, for models with a sound effect; it is not
  *     part of MQTT or the status log. See register-map.md.
@@ -53,6 +56,7 @@
 #include <esp_system.h>      // esp_reset_reason()
 #include <esp_timer.h>       // esp_timer_get_time()
 #include "icons.h"           // app icons for "install on the phone" (second tab in the Arduino IDE)
+#include "thermostat.h"      // temperature control types and decision logic (third tab; plain C++, tested on a PC)
 
 // =====================================================================================================
 // 1. SETTINGS
@@ -83,6 +87,7 @@ static char cfg_mqttPassword[40] = "dimplex";
 
 // ---- Timing ----
 #define FIREPLACE_POLL_INTERVAL_MS   5000     // how often bleTask reads the registers (temperature etc.)
+#define THERMOSTAT_INTERVAL_MS       1000     // how often bleTask runs the thermostat of the bridge (decision only; it switches when needed)
 #define BLE_RETRY_INTERVAL_MS        5000     // pause between BLE connect attempts
 #define MESSAGE_SHOW_TIME_MS         8000     // how long a result message stays on the web page
 #define PAGE_REFRESH_MS              3000     // live block refresh interval
@@ -122,6 +127,9 @@ static const char *TOPIC_HEATER_POWER_STATE = "dimplex/heater_power/state"; // l
 static const char *TOPIC_TEMPERATURE_STATE  = "dimplex/temperature/state";  // 0x0055: byte1 = degrees, byte2 = tenths
 static const char *TOPIC_RAW_STATE          = "dimplex/raw/state";          // diagnostics: raw bytes of the interesting registers
 static const char *TOPIC_DIAG_STATE         = "dimplex/diag/state";         // JSON with restart reason, uptime, memory, signal ... (every 60 s)
+static const char *TOPIC_ROOM_TEMPERATURE_SET = "dimplex/room_temperature/set";   // room temperature in degrees C, e.g. 21.3 (plain number, publish WITHOUT retain)
+static const char *TOPIC_CONTROL_MODE_STATE = "dimplex/control_mode/state"; // text: which temperature control is selected on the web page
+static const char *TOPIC_THERMOSTAT_STATE   = "dimplex/thermostat/state";   // text: heating / target reached / no room temperature / off / not used
 
 WiFiClient g_wifiClient;                  // owned by mqttTask
 PubSubClient g_mqttClient(g_wifiClient);  // owned by mqttTask: no other task may call it
@@ -136,7 +144,7 @@ static bool g_webStarted = false;
 
 enum CommandType : uint8_t { CMD_FLAME_EFFECT, CMD_HEATER, CMD_HEATER_POWER, CMD_SETPOINT, CMD_SETPOINT_DELTA,
                              CMD_FLAME_LEVEL, CMD_VOLUME, CMD_BLE_RELEASE, CMD_BLE_RESUME,
-                             CMD_SCAN, CMD_APPLY_SETTINGS, CMD_FACTORY_RESET };
+                             CMD_SCAN, CMD_APPLY_SETTINGS, CMD_FACTORY_RESET, CMD_CONTROL_MODE, CMD_APPLY_THERMOSTAT };
 enum CommandSource : uint8_t { SOURCE_WEB = 0, SOURCE_MQTT = 1 };
 struct Command { CommandType type; int16_t argument; CommandSource source; };
 static QueueHandle_t g_commandQueue = nullptr;
@@ -159,6 +167,12 @@ struct SharedState {
   bool valid, connected, ready, bleEnabled, haveTarget;
   uint8_t regControl[2], regHeater[2], regHeaterPower, flameLevel, volume, regTemperature[3], regUnknown3c[3], regUnknown63[2];
   int setpoint, setpointMin, setpointMax;
+  // temperature control in the bridge (thermostat.h)
+  uint8_t controlMode, thermostatState;      // ControlMode, ThermostatState
+  bool thermostatWanted;                     // the user wants heating (in a bridge mode this is what the Heater switch shows)
+  int bridgeSetpoint;                        // setpoint of the bridge's own control, saved in flash
+  ThermostatSettings thermo;                 // margins and time-out
+  int controlTempTenths; bool controlTempValid;   // temperature used by the last decision (tenths of a degree)
   char targetAddress[20];                    // fireplace we are connected to / will connect to
   char configuredAddress[20], passkeyText[12];   // selected fireplace ("" = auto-detect) and passkey, as saved
   ScanEntry scan[SCAN_MAX]; int scanCount; bool scanning; uint32_t scanFinishedMs;   // result of the last scan
@@ -182,7 +196,7 @@ static volatile uint32_t g_wifiDrops = 0, g_wifiLastOutageSeconds = 0;   // Wi-F
 // NOTE for the Arduino IDE: it inserts automatic function prototypes before the FIRST function in this file. All types
 // (struct / enum) must therefore be defined above the first function, otherwise the build fails with "does not name a type".
 // Types used by the web feedback (see "feedback for pressed buttons" further down):
-enum AwaitedControl { AW_BLE, AW_EFFECT, AW_HEATER, AW_HEATER_POWER, AW_SETPOINT, AW_FLAME_LEVEL, AW_VOLUME, AW_COUNT };
+enum AwaitedControl { AW_BLE, AW_EFFECT, AW_HEATER, AW_HEATER_POWER, AW_SETPOINT, AW_FLAME_LEVEL, AW_VOLUME, AW_CONTROL_MODE, AW_COUNT };
 struct AwaitedValue { bool active; int target; uint32_t sinceMs; };
 
 // ---- crash diagnostics: a small log that survives a restart ----
@@ -304,6 +318,15 @@ static void copySnapshot(SharedState &destination) {
 }
 static inline bool isFlameEffectOn(const SharedState &s) { return s.valid && s.regControl[0] != 0; }
 static inline bool isHeaterOn(const SharedState &s)      { return s.valid && s.regControl[0] != 0 && (s.regHeater[0] & 0x04) == 0; }
+// What the Heater switch (web page and Home Assistant) shows. Without bridge control that is the real state of the heater.
+// With bridge control it is the user's wish: the bridge may switch the heater off for a while because the temperature was
+// reached, and the switch should then still read "on" (the thermostat status says what is happening).
+static inline bool isHeaterSwitchOn(const SharedState &s) {
+  if (s.controlMode == CONTROL_FIREPLACE) return isHeaterOn(s);
+  return s.valid && s.regControl[0] != 0 && s.thermostatWanted;
+}
+// The setpoint the user is working with: the bridge's own setpoint in a bridge mode, otherwise the fireplace's setpoint.
+static inline int displayedSetpoint(const SharedState &s) { return s.controlMode == CONTROL_FIREPLACE ? s.setpoint : s.bridgeSetpoint; }
 
 // New fireplace settings entered on the web page. loop() stages them here (under the mutex); bleTask validates
 // and applies them (CMD_APPLY_SETTINGS), so the settings variables are only changed by one task.
@@ -322,6 +345,36 @@ static bool queueCommand(CommandType type, int argument, CommandSource source) {
   if (!g_commandQueue || xQueueSend(g_commandQueue, &c, 0) != pdTRUE) { g_commandsDropped = g_commandsDropped + 1; return false; }
   g_commandsQueued++;
   return true;
+}
+
+// ---- room temperature from MQTT (for the control mode "room sensor") ----
+// mqttTask stores every valid value here; bleTask (the thermostat) and loop() (the web page) read it. Both sides use the
+// snapshot mutex for the few microseconds it takes to copy three numbers.
+static int g_roomTempTenths = 0;                 // last valid value in tenths of a degree
+static uint32_t g_roomTempReceivedMs = 0;        // millis() when it arrived
+static bool g_roomTempKnown = false;             // a valid value has arrived since the start
+static void storeRoomTemperature(int tenths) {
+  xSemaphoreTake(g_snapshotMutex, portMAX_DELAY);
+  g_roomTempTenths = tenths; g_roomTempReceivedMs = millis(); g_roomTempKnown = true;
+  xSemaphoreGive(g_snapshotMutex);
+}
+// Latest room temperature and its age. Returns false when no valid value has arrived yet.
+static bool readRoomTemperature(int &tenths, uint32_t &ageMs) {
+  xSemaphoreTake(g_snapshotMutex, portMAX_DELAY);
+  bool known = g_roomTempKnown; tenths = g_roomTempTenths; ageMs = millis() - g_roomTempReceivedMs;
+  xSemaphoreGive(g_snapshotMutex);
+  return known;
+}
+
+// New thermostat settings entered on the web page (margins in tenths of a degree, time-out in minutes). loop() stages them here;
+// bleTask validates and applies them (CMD_APPLY_THERMOSTAT), so the settings are only changed by one task.
+static int g_pendingThermostat[5] = {0, 0, 0, 0, 0};   // external off, external on, internal off, internal on, time-out
+static bool g_pendingThermostatValid = false;
+static void stageThermostatSettings(const int values[5]) {
+  xSemaphoreTake(g_snapshotMutex, portMAX_DELAY);
+  for (int i = 0; i < 5; i++) g_pendingThermostat[i] = values[i];
+  g_pendingThermostatValid = true;
+  xSemaphoreGive(g_snapshotMutex);
 }
 
 // =====================================================================================================
@@ -357,8 +410,26 @@ static ScanEntry g_scanEntries[SCAN_MAX]; static int g_scanCount = 0; static boo
 static StatusSample g_history[HISTORY_SIZE]; static int g_historyCount = 0, g_historyHead = 0;
 static float g_tempMin = 999, g_tempMax = -999;
 static uint32_t g_lastTempChangeMs = 0, g_lastHistoryLogMs = 0;
+static bool g_temperatureFresh = false;         // the last read of 0x0055 succeeded
+
+// ---- temperature control in the bridge (see thermostat.h) ----
+static ControlMode g_controlMode = CONTROL_FIREPLACE;   // saved in flash (key "ctlmode"); default: the fireplace regulates
+static ThermostatSettings g_thermo = THERMOSTAT_DEFAULT_SETTINGS;   // margins and time-out, saved in flash
+static int g_bridgeSetpoint = 21;               // setpoint of the bridge's own control, saved in flash (key "bsetp")
+static bool g_thermostatWanted = false;         // the user wants heating (Heater switch on) in a bridge mode
+static bool g_thermostatStartRule = false;      // the next decision is a start: heat while below the setpoint
+static ThermostatState g_thermostatState = THERMO_INACTIVE;
+static int g_controlTempTenths = 0; static bool g_controlTempValid = false;   // temperature of the last decision
+static uint32_t g_thermostatRetryAtMs = 0;      // after a switch that was not confirmed: do not try again before this time (0 = no wait)
+static uint32_t g_setpointSyncRetryAtMs = 0;    // the same for writing the setpoint to the fireplace
+static bool g_thermostatDirty = false;          // something the pages show has changed: publish a new snapshot
 
 static void readFireplaceState();
+
+// Change the thermostat state; the snapshot is published by bleTask's loop when the state has changed.
+static void setThermostatState(ThermostatState state) {
+  if (state != g_thermostatState) { g_thermostatState = state; g_thermostatDirty = true; }
+}
 
 // Remember a one-line result for the web page and the serial log.
 static void setMessage(const String &text) { g_message = text; g_messageTimeMs = millis(); g_messageDirty = true; }
@@ -380,6 +451,9 @@ static void publishSnapshot() {
   if (g_messageDirty) { strlcpy(s.message, g_message.c_str(), sizeof(s.message)); s.messageTimeMs = g_messageTimeMs; g_messageDirty = false; }
   memcpy(s.history, g_history, sizeof(g_history)); s.historyCount = g_historyCount; s.historyHead = g_historyHead;
   s.tempMin = g_tempMin; s.tempMax = g_tempMax; s.lastTempChangeMs = g_lastTempChangeMs;
+  s.controlMode = g_controlMode; s.thermostatState = g_thermostatState; s.thermostatWanted = g_thermostatWanted;
+  s.bridgeSetpoint = g_bridgeSetpoint; s.thermo = g_thermo; s.controlTempTenths = g_controlTempTenths; s.controlTempValid = g_controlTempValid;
+  g_thermostatDirty = false;
   g_sharedVersion = g_sharedVersion + 1;
   xSemaphoreGive(g_snapshotMutex);
 }
@@ -403,8 +477,29 @@ static void loadSettings() {
   strlcpy(cfg_fireplaceAddress, g_prefs.getString("addr", cfg_fireplaceAddress).c_str(), sizeof(cfg_fireplaceAddress));
   strlcpy(cfg_passkeyText, g_prefs.getString("pkey", cfg_passkeyText).c_str(), sizeof(cfg_passkeyText));
   strlcpy(g_detectedAddress, g_prefs.getString("detaddr", "").c_str(), sizeof(g_detectedAddress));
+  // temperature control: mode, bridge setpoint, margins and time-out (values that are missing or out of range keep the defaults)
+  uint8_t mode = g_prefs.getUChar("ctlmode", CONTROL_FIREPLACE);
+  g_controlMode = mode <= CONTROL_INTERNAL ? (ControlMode) mode : CONTROL_FIREPLACE;
+  int setpoint = g_prefs.getUChar("bsetp", 21);
+  g_bridgeSetpoint = setpoint < 15 ? 15 : (setpoint > 30 ? 30 : setpoint);
+  ThermostatSettings loaded = { g_prefs.getUChar("xoff", g_thermo.externalOffAbove), g_prefs.getUChar("xon", g_thermo.externalOnBelow),
+                                g_prefs.getUChar("ioff", g_thermo.internalOffAbove), g_prefs.getUChar("ion", g_thermo.internalOnBelow),
+                                g_prefs.getUShort("tmo", g_thermo.timeoutMinutes) };
+  if (thermostatSettingsValid(loaded.externalOffAbove, loaded.externalOnBelow, loaded.internalOffAbove, loaded.internalOnBelow, loaded.timeoutMinutes)) g_thermo = loaded;
   g_prefs.end();
   parsePasskey();
+}
+// Save the control mode (flash is only written when the value changes).
+static void saveControlMode() { g_prefs.begin("cfg", false); g_prefs.putUChar("ctlmode", (uint8_t) g_controlMode); g_prefs.end(); }
+// Save the bridge setpoint, so it survives a restart or power loss.
+static void saveBridgeSetpoint() { g_prefs.begin("cfg", false); g_prefs.putUChar("bsetp", (uint8_t) g_bridgeSetpoint); g_prefs.end(); }
+// Save the margins and the time-out.
+static void saveThermostatSettings() {
+  g_prefs.begin("cfg", false);
+  g_prefs.putUChar("xoff", g_thermo.externalOffAbove); g_prefs.putUChar("xon", g_thermo.externalOnBelow);
+  g_prefs.putUChar("ioff", g_thermo.internalOffAbove); g_prefs.putUChar("ion", g_thermo.internalOnBelow);
+  g_prefs.putUShort("tmo", g_thermo.timeoutMinutes);
+  g_prefs.end();
 }
 // Remember (or clear, with nullptr) the auto-detected fireplace address so later boots can skip the scan.
 static void rememberDetectedAddress(const char *mac) {
@@ -663,6 +758,7 @@ static void readFireplaceState() {
       g_limitsRead = true;
     }
   }
+  g_temperatureFresh = nTemperature >= 3;                 // the thermostat only trusts a reading from this round
   if (nTemperature >= 3) { memcpy(g_regTemperature, temperature, 3); logStatusSample(); }
   g_registersRead = true;
   g_lastReadMs = millis();
@@ -697,6 +793,7 @@ static bool bleSetFlameEffect(bool on) {
   readFireplaceState();
   if (on && flameEffectIsOn()) { setMessage("Flame effect is already on"); return true; }
   if (!g_initSent) sendInitSequence();
+  if (!on) { g_thermostatWanted = false; setThermostatState(THERMO_INACTIVE); }     // everything off: nothing left to regulate
   uint8_t value = on ? 0x06 : 0x00; writeRegister(g_chControl, &value, 1);
   logLine("ble", "flame effect -> %s (0x0040=%02x)", on ? "ON" : "OFF", value);
   setMessage(on ? "Flame effect switched on" : "Fireplace switched off (effect and heater)");
@@ -714,9 +811,12 @@ static bool bleSetFlameLevel(uint8_t level) {
   logLine("ble", "flame level -> %u", level);
   return true;
 }
+// Switch the heater of the fireplace itself (the "element mode"). This is the one place that does it, for the user's button
+// (without bridge control) and for the thermostat (with bridge control).
 // Heater on: the remote writes 0x0040 = 01 and then 0x0014 = 02 00 (about 0.7 s later). Only while the flame effect is on.
 // Heater off: 0x0040 = 06 (back to "effect on, heater off").
-static bool bleSetHeater(bool on) {
+// Returns true when the heater is in the requested state afterwards (confirmed by reading back).
+static bool bleSwitchHeaterPhysical(bool on) {
   if (!requireBleReady() || !g_chHeater) return false;
   readFireplaceState();
   if (on) {
@@ -728,16 +828,104 @@ static bool bleSetHeater(bool on) {
     writeRegister(g_chHeater, second, 2);
     logLine("ble", "heater -> ON (0x0040=01, 0x0014=0200)");
     setMessage("Heater switched on");
-    readUntil([] { return heaterIsOn(); }, 4000, "heater on"); return true;
+    readUntil([] { return heaterIsOn(); }, 4000, "heater on"); return heaterIsOn();
   }
   if (!flameEffectIsOn() || !heaterIsOn()) { setMessage("Heater is already off"); return true; }
   uint8_t value = 0x06; writeRegister(g_chControl, &value, 1);
   logLine("ble", "heater -> OFF (0x0040=06)");
   setMessage("Heater switched off");
-  readUntil([] { return !heaterIsOn(); }, 4000, "heater off"); return true;
+  readUntil([] { return !heaterIsOn(); }, 4000, "heater off"); return !heaterIsOn();
 }
-// Setpoint: 0x0018 = LE16 degrees C (remote: 20 -> 14 00). Only while the heater is on, clamped to the limits.
-static bool bleSetSetpoint(int degrees) {
+
+// With bridge control the fireplace's own thermostat keeps running as a back-up (if the bridge fails, the fireplace still
+// regulates). The fireplace starts at 21 degrees every time the heater is switched on, so after a start the bridge setpoint is
+// written to it. Quiet (no message on the page); tries again at most every 15 s when the write is not confirmed.
+static void syncFireplaceSetpoint() {
+  if (!heaterIsOn() || !g_chSetpoint || g_setpoint == g_bridgeSetpoint) return;
+  if (g_setpointSyncRetryAtMs != 0 && (int32_t)(g_setpointSyncRetryAtMs - millis()) > 0) return;
+  g_setpointSyncRetryAtMs = millis() + 15000;
+  uint8_t bytes[2] = {(uint8_t)(g_bridgeSetpoint & 0xff), (uint8_t)(g_bridgeSetpoint >> 8)};
+  writeRegister(g_chSetpoint, bytes, 2);
+  logLine("thermo", "fireplace setpoint %d -> %d C (back-up thermostat)", g_setpoint, g_bridgeSetpoint);
+  g_awaitedSetpoint = g_bridgeSetpoint;
+  readUntil([] { return g_setpoint == g_awaitedSetpoint; }, 3000, "setpoint sync");
+  if (g_setpoint == g_bridgeSetpoint) g_setpointSyncRetryAtMs = 0;
+}
+
+// The thermostat of the bridge (modes "room sensor" and "internal sensor"). Called about once a second by bleTask while the
+// link is ready. It decides with decideThermostat() (thermostat.h) and switches the heater of the fireplace.
+//   - The user's wish (g_thermostatWanted) is the Heater switch. Switching it off stops the control; the heater stays off.
+//   - Fail-safe (room sensor): without a room temperature for the time-out (or none since the start) the heater is switched
+//     off. The wish stays, so when a new temperature arrives the control continues by itself.
+//   - A heater that is running while the bridge did not ask for it (started on the fireplace itself, or after a restart of
+//     the bridge) is taken over, so it never runs unregulated.
+static void runThermostat() {
+  if (!g_bleReady || !g_registersRead) return;
+  if (g_controlMode == CONTROL_FIREPLACE || !flameEffectIsOn()) {     // no bridge control, or the fireplace is off
+    g_thermostatWanted = false; setThermostatState(THERMO_INACTIVE); return;
+  }
+  bool heating = heaterIsOn();
+  if (!g_thermostatWanted) {
+    if (!heating) { setThermostatState(THERMO_INACTIVE); return; }
+    g_thermostatWanted = true; g_thermostatDirty = true;
+    logLine("thermo", "heater is running: the bridge takes over the control");
+  }
+  bool external = g_controlMode == CONTROL_EXTERNAL;
+  int tenths = 0; bool fresh;
+  if (external) {
+    uint32_t ageMs;
+    fresh = readRoomTemperature(tenths, ageMs) && ageMs <= (uint32_t) g_thermo.timeoutMinutes * 60000UL;
+  } else {
+    tenths = g_regTemperature[1] * 10 + g_regTemperature[2] % 10;
+    fresh = g_temperatureFresh;
+  }
+  g_controlTempTenths = tenths; g_controlTempValid = fresh;
+  if (!fresh && !external) return;                    // internal sensor not readable this round: leave everything as it is
+  ThermostatInput input = { g_controlMode, g_thermostatState, g_thermostatStartRule, fresh, tenths, g_bridgeSetpoint, g_thermo };
+  ThermostatDecision decision = decideThermostat(input);
+  g_thermostatStartRule = false;
+  if (decision.state != g_thermostatState) {
+    logLine("thermo", "%s -> %s (temperature %d.%d, setpoint %d, off at %d.%d, on at %d.%d)",
+            thermostatStateText(g_controlMode, g_thermostatState), thermostatStateText(g_controlMode, decision.state), tenths / 10, abs(tenths % 10),
+            g_bridgeSetpoint, decision.offAboveTenths / 10, abs(decision.offAboveTenths % 10), decision.onBelowTenths / 10, abs(decision.onBelowTenths % 10));
+    if (decision.state == THERMO_NO_SENSOR) setMessage(String("No room temperature for ") + String(g_thermo.timeoutMinutes) + " min: heater switched off");
+  }
+  setThermostatState(decision.state);
+  bool retryHold = g_thermostatRetryAtMs != 0 && (int32_t)(g_thermostatRetryAtMs - millis()) > 0;
+  if (decision.heaterOn != heating && !retryHold) {
+    bool confirmed = bleSwitchHeaterPhysical(decision.heaterOn);
+    g_thermostatRetryAtMs = confirmed ? 0 : millis() + 30000;      // a switch that fails is tried again after 30 s
+  }
+  if (decision.heaterOn) syncFireplaceSetpoint();
+}
+
+// Heater button / switch. Without bridge control it switches the heater of the fireplace. With bridge control it sets or clears
+// the user's wish for heating and lets the thermostat do the switching.
+static bool bleSetHeater(bool on) {
+  if (g_controlMode == CONTROL_FIREPLACE) return bleSwitchHeaterPhysical(on);
+  if (!requireBleReady() || !g_chHeater) return false;
+  readFireplaceState();
+  if (on) {
+    if (!flameEffectIsOn()) { setMessage("Heater not started: switch the flame effect on first"); return false; }
+    g_thermostatWanted = true; g_thermostatStartRule = true; g_thermostatRetryAtMs = 0; g_thermostatDirty = true;
+    logLine("thermo", "heating switched on by the user (%s, setpoint %d)", controlModeText(g_controlMode), g_bridgeSetpoint);
+    runThermostat();
+    switch (g_thermostatState) {
+      case THERMO_HEATING:   setMessage("Heating: the heater is on"); break;
+      case THERMO_SATISFIED: setMessage("Heating switched on: the temperature is already at the setpoint, the heater stays off"); break;
+      case THERMO_NO_SENSOR: setMessage("Heating switched on: waiting for a room temperature before the heater starts"); break;
+      default: break;
+    }
+    return true;
+  }
+  g_thermostatWanted = false; setThermostatState(THERMO_INACTIVE);
+  logLine("thermo", "heating switched off by the user");
+  if (heaterIsOn()) return bleSwitchHeaterPhysical(false);
+  setMessage("Heater is off");
+  return true;
+}
+// Setpoint of the fireplace itself: 0x0018 = LE16 degrees C (remote: 20 -> 14 00). Only while the heater is on, clamped to the limits.
+static bool bleSetFireplaceSetpoint(int degrees) {
   if (!requireBleReady() || !g_chSetpoint) return false;
   readFireplaceState();
   if (!heaterIsOn()) { setMessage("Setpoint not changed: the heater is off"); return false; }
@@ -751,6 +939,22 @@ static bool bleSetSetpoint(int degrees) {
   setMessage((g_setpoint == degrees) ? "Setpoint set to " + String(degrees) + " C"
                                      : "Setpoint sent (" + String(degrees) + " C) but the fireplace reports " + String(g_setpoint));
   return true;
+}
+// Setpoint of the bridge's own control: saved in flash, works with the heater off and without a Bluetooth link. The thermostat
+// applies it at once and the fireplace gets the same value as back-up setpoint (syncFireplaceSetpoint).
+static bool bleSetBridgeSetpoint(int degrees) {
+  if (degrees < g_setpointMin) degrees = g_setpointMin;
+  if (degrees > g_setpointMax) degrees = g_setpointMax;
+  if (degrees != g_bridgeSetpoint) { g_bridgeSetpoint = degrees; saveBridgeSetpoint(); g_thermostatDirty = true; }
+  g_setpointSyncRetryAtMs = 0;
+  logLine("thermo", "bridge setpoint -> %d C", degrees);
+  setMessage("Setpoint set to " + String(degrees) + " C");
+  runThermostat();
+  return true;
+}
+// Setpoint from the web page or MQTT: the bridge's own setpoint in a bridge mode, otherwise the fireplace's setpoint.
+static bool bleSetSetpoint(int degrees) {
+  return g_controlMode == CONTROL_FIREPLACE ? bleSetFireplaceSetpoint(degrees) : bleSetBridgeSetpoint(degrees);
 }
 // Heater power: 0x0048 = 01 (low, 0.9 kW) / 03 (high, 1.8 kW). Confirmed with a power meter; the fireplace remembers it.
 static bool bleSetHeaterPower(bool high) {
@@ -778,6 +982,41 @@ static bool bleSetVolume(uint8_t volume) {
   readUntil([] { return g_volume == g_awaitedVolume; }, 2000, "volume");
   setMessage("Volume " + String(volume));
   return true;
+}
+
+// Choose the temperature control (web page). The mode is saved in flash. Switching to "fireplace thermostat" ends the bridge's
+// control: the heater keeps its present state. Switching to a bridge mode starts with the start rule; a heater that is running
+// is taken over by runThermostat(). With the room sensor and no recent temperature that switches the heater off (fail-safe).
+static void bleSetControlMode(ControlMode mode) {
+  if (mode == g_controlMode) { setMessage(String("Temperature control is already: ") + controlModeText(mode)); return; }
+  g_controlMode = mode;
+  saveControlMode();
+  g_thermostatStartRule = true; g_thermostatRetryAtMs = 0; g_setpointSyncRetryAtMs = 0; g_thermostatDirty = true;
+  if (mode == CONTROL_FIREPLACE) { g_thermostatWanted = false; setThermostatState(THERMO_INACTIVE); }
+  logLine("thermo", "temperature control -> %s", controlModeText(mode));
+  setMessage(String("Temperature control: ") + controlModeText(mode));
+  runThermostat();
+}
+// Apply the margins and time-out staged by the web page: check them, save them in flash and use them from now on.
+static void bleApplyThermostatSettings() {
+  int values[5]; bool pending;
+  xSemaphoreTake(g_snapshotMutex, portMAX_DELAY);
+  for (int i = 0; i < 5; i++) values[i] = g_pendingThermostat[i];
+  pending = g_pendingThermostatValid; g_pendingThermostatValid = false;
+  xSemaphoreGive(g_snapshotMutex);
+  if (!pending) return;
+  if (!thermostatSettingsValid(values[0], values[1], values[2], values[3], values[4])) {
+    setMessage("Not saved: margins must be 0 to 5.0 degrees (at least 0.2 in total per sensor) and the time-out 1 to 240 minutes");
+    return;
+  }
+  g_thermo.externalOffAbove = values[0]; g_thermo.externalOnBelow = values[1];
+  g_thermo.internalOffAbove = values[2]; g_thermo.internalOnBelow = values[3];
+  g_thermo.timeoutMinutes = (uint16_t) values[4];
+  saveThermostatSettings();
+  g_thermostatDirty = true;
+  logLine("thermo", "settings: room sensor +%d/-%d, internal sensor +%d/-%d (tenths), time-out %d min", values[0], values[1], values[2], values[3], values[4]);
+  setMessage("Temperature control settings saved");
+  runThermostat();
 }
 
 // Scan for fireplaces (4 s) and keep the result for the Settings page. A fireplace that already has a connection
@@ -858,6 +1097,7 @@ static const char *commandName(CommandType type) {
     case CMD_VOLUME: return "volume";               case CMD_BLE_RELEASE: return "bluetooth release";
     case CMD_BLE_RESUME: return "bluetooth resume"; case CMD_SCAN: return "scan";
     case CMD_APPLY_SETTINGS: return "apply settings"; case CMD_FACTORY_RESET: return "factory reset";
+    case CMD_CONTROL_MODE: return "control mode";   case CMD_APPLY_THERMOSTAT: return "thermostat settings";
   }
   return "?";
 }
@@ -870,15 +1110,20 @@ static void executeCommand(const Command &c) {
     case CMD_HEATER_POWER: bleSetHeaterPower(c.argument != 0); break;
     case CMD_SETPOINT:     bleSetSetpoint(c.argument); break;
     case CMD_SETPOINT_DELTA:                                   // +/- buttons: relative to the value read now, so quick clicks add up
+      if (g_controlMode != CONTROL_FIREPLACE) { bleSetBridgeSetpoint(g_bridgeSetpoint + c.argument); break; }
       readFireplaceState();
-      if (heaterIsOn()) bleSetSetpoint(g_setpoint + c.argument); else setMessage("Setpoint not changed: the heater is off");
+      if (heaterIsOn()) bleSetFireplaceSetpoint(g_setpoint + c.argument); else setMessage("Setpoint not changed: the heater is off");
       break;
     case CMD_FLAME_LEVEL:  if (bleSetFlameLevel((uint8_t) c.argument)) { setMessage("Flame level F" + String(c.argument)); delay(200); readFireplaceState(); } break;
     case CMD_VOLUME:       bleSetVolume((uint8_t) c.argument); break;
     case CMD_SCAN:         bleScanForFireplaces(); break;
     case CMD_APPLY_SETTINGS: bleApplyPendingSettings(); break;
     case CMD_FACTORY_RESET:  bleFactoryReset(); break;
-    case CMD_BLE_RELEASE:  bleReleaseLink(); setMessage("Bluetooth released"); break;
+    case CMD_CONTROL_MODE:   bleSetControlMode((ControlMode) c.argument); break;
+    case CMD_APPLY_THERMOSTAT: bleApplyThermostatSettings(); break;
+    case CMD_BLE_RELEASE:                                      // the original remote takes over: the bridge stops regulating
+      g_thermostatWanted = false; setThermostatState(THERMO_INACTIVE);
+      bleReleaseLink(); setMessage("Bluetooth released"); break;
     case CMD_BLE_RESUME:   bleResumeLink(); setMessage("Connecting..."); break;
   }
   if (g_messageDirty) logLine(c.source == SOURCE_MQTT ? "mqtt" : "web", "%s", g_message.c_str());
@@ -887,7 +1132,7 @@ static void executeCommand(const Command &c) {
 // BLE task: connects (and reconnects) to the fireplace, runs the queued commands in order and
 // reads the registers every FIREPLACE_POLL_INTERVAL_MS. Updates the shared snapshot after every change.
 static void bleTask(void *) {
-  uint32_t lastPollMs = 0, lastClockTryMs = 0;
+  uint32_t lastPollMs = 0, lastClockTryMs = 0, lastThermostatMs = 0;
   bool lastReady = false, lastConnected = false, lastEnabled = true;
   for (;;) {
     setBleStep("idle");
@@ -922,6 +1167,10 @@ static void bleTask(void *) {
       lastPollMs = millis();
     }
     if (g_bleReady && millis() - lastPollMs > FIREPLACE_POLL_INTERVAL_MS) { lastPollMs = millis(); setBleStep("polling the registers"); readFireplaceState(); publishSnapshot(); }
+    if (g_bleReady && millis() - lastThermostatMs >= THERMOSTAT_INTERVAL_MS) {          // temperature control in the bridge (a no-op in the mode "fireplace thermostat")
+      lastThermostatMs = millis(); setBleStep("thermostat"); runThermostat();
+      if (g_thermostatDirty) publishSnapshot();
+    }
     if (lastReady != g_bleReady || lastConnected != g_bleConnected || lastEnabled != g_bleEnabled) {   // link state changed (callbacks run in the NimBLE host task)
       lastReady = g_bleReady; lastConnected = g_bleConnected; lastEnabled = g_bleEnabled;
       publishSnapshot();
@@ -939,6 +1188,8 @@ static int g_publishedPower = -1, g_publishedFlameLevel = -1, g_publishedHeater 
 static int g_publishedHeaterPower = -1;        // 0 = low, 1 = high, 2 = unknown value
 static int g_publishedSetpoint = -1;           // degrees; SETPOINT_NONE = "unknown" was published (heater off)
 static int g_publishedTemperatureTenths = -1;  // tenths of a degree (243 = 24.3); SETPOINT_NONE = "unknown" was published
+static int g_publishedControlMode = -1;        // ControlMode
+static int g_publishedThermostat = -1;         // mode * 10 + ThermostatState
 static const int SETPOINT_NONE = -2;           // marker for "published as unknown"
 static const int TEMPERATURE_DEADBAND_TENTHS = 2;   // the temperature is only published when it moved by at least 0.2 degrees
 static char g_publishedRaw[120] = "";
@@ -967,18 +1218,22 @@ static void publishSetpointUnknown() {
 static void echoExpectedState(CommandType type, int argument) {
   bool echoed = false;
   const SharedState &s = g_mqttSnapshot;                 // last known real state
+  bool bridgeControl = s.controlMode != CONTROL_FIREPLACE;
   auto publishOnOff = [&](const char *topic, int &published, bool on) { g_mqttClient.publish(topic, on ? "ON" : "OFF", true); published = on; echoed = true; };
   switch (type) {
     case CMD_FLAME_EFFECT:
       publishOnOff(TOPIC_POWER_STATE, g_publishedPower, argument != 0);
-      if (!argument) { publishOnOff(TOPIC_HEATER_STATE, g_publishedHeater, false); publishSetpointUnknown(); }       // everything off includes the heater
+      if (!argument) {                                                                       // everything off includes the heater
+        publishOnOff(TOPIC_HEATER_STATE, g_publishedHeater, false);
+        if (!bridgeControl) publishSetpointUnknown();                                        // (the bridge setpoint stays known)
+      }
       break;
     case CMD_HEATER:
-      if (!argument) { publishOnOff(TOPIC_HEATER_STATE, g_publishedHeater, false); publishSetpointUnknown(); }
+      if (!argument) { publishOnOff(TOPIC_HEATER_STATE, g_publishedHeater, false); if (!bridgeControl) publishSetpointUnknown(); }
       else if (isFlameEffectOn(s)) publishOnOff(TOPIC_HEATER_STATE, g_publishedHeater, true);   // only works while the effect is on
       break;
     case CMD_SETPOINT:
-      if (isHeaterOn(s)) {
+      if (bridgeControl || isHeaterOn(s)) {                          // the bridge setpoint can be set at any time
         int deg = argument < s.setpointMin ? s.setpointMin : (argument > s.setpointMax ? s.setpointMax : argument);
         char text[12]; snprintf(text, sizeof(text), "%d", deg); g_mqttClient.publish(TOPIC_SETPOINT_STATE, text, true); g_publishedSetpoint = deg; echoed = true;
       }
@@ -999,6 +1254,7 @@ static void forgetPublishedValues() {
   g_publishedBleEnabled = -1;
   g_publishedPower = g_publishedFlameLevel = g_publishedHeater = g_publishedHeaterPower = g_publishedSetpoint = -1;
   g_publishedTemperatureTenths = -1; g_publishedRaw[0] = 0;
+  g_publishedControlMode = g_publishedThermostat = -1;
   g_diagnosticsDue = true;
 }
 
@@ -1064,6 +1320,10 @@ static void publishHomeAssistantDiscovery() {
                 "\",\"ic\":\"mdi:flash\"" + avail);
   publishEntity("sensor", "temperature", String("\"name\":\"Internal temperature\",\"uniq_id\":\"dimplex_temperature\",\"stat_t\":\"") + TOPIC_TEMPERATURE_STATE +
                 "\",\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\",\"stat_cla\":\"measurement\"" + avail);
+  publishEntity("sensor", "control_mode", String("\"name\":\"Temperature control\",\"uniq_id\":\"dimplex_control_mode\",\"stat_t\":\"") + TOPIC_CONTROL_MODE_STATE +
+                "\",\"ic\":\"mdi:thermostat\"" + avail);
+  publishEntity("sensor", "thermostat", String("\"name\":\"Thermostat status\",\"uniq_id\":\"dimplex_thermostat\",\"stat_t\":\"") + TOPIC_THERMOSTAT_STATE +
+                "\",\"ic\":\"mdi:thermostat-auto\"" + avail);
   publishEntity("sensor", "raw", String("\"name\":\"Raw registers\",\"uniq_id\":\"dimplex_raw\",\"stat_t\":\"") + TOPIC_RAW_STATE +
                 "\",\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:code-braces\"" + avail);
   publishDiagnosticDiscovery();
@@ -1078,6 +1338,11 @@ static void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   else if (!strcmp(topic, TOPIC_BLE_SET))        queueMqttCommand(isOn ? CMD_BLE_RESUME : CMD_BLE_RELEASE, 0);         // Bluetooth link on/off
   else if (!strcmp(topic, TOPIC_HEATER_SET))     queueMqttCommand(CMD_HEATER, isOn ? 1 : 0);                        // heater on/off
   else if (!strcmp(topic, TOPIC_SETPOINT_SET))   queueMqttCommand(CMD_SETPOINT, (int)(atof(text) + 0.5));          // the BLE side clamps to the limits
+  else if (!strcmp(topic, TOPIC_ROOM_TEMPERATURE_SET)) {                                                           // room temperature for the control mode "room sensor"
+    int tenths;
+    if (parseTemperatureTenths(text, tenths)) storeRoomTemperature(tenths);                                        // an invalid value does not count as a fresh reading
+    else logLine("mqtt", "ignored room temperature '%s'", text);
+  }
   else if (!strcmp(topic, TOPIC_FLAME_LEVEL_SET)) {                                                                // flame intensity 1..6
     int level = atoi(text); if (level < 1) level = 1; if (level > 6) level = 6;
     queueMqttCommand(CMD_FLAME_LEVEL, level);
@@ -1116,6 +1381,7 @@ static bool tryMqttConnect() {
     g_mqttClient.publish(TOPIC_AVAILABILITY, "online", true);
     g_mqttClient.subscribe(TOPIC_POWER_SET); g_mqttClient.subscribe(TOPIC_FLAME_LEVEL_SET);
     g_mqttClient.subscribe(TOPIC_HEATER_SET); g_mqttClient.subscribe(TOPIC_SETPOINT_SET); g_mqttClient.subscribe(TOPIC_BLE_SET);
+    g_mqttClient.subscribe(TOPIC_ROOM_TEMPERATURE_SET);
     publishHomeAssistantDiscovery();
     forgetPublishedValues();                       // republish everything after (re)connecting
     waitMs = 3000; failures = 0;
@@ -1134,8 +1400,22 @@ static void publishChanges(const SharedState &s) {
     g_mqttClient.publish(TOPIC_BLE_STATE, s.bleEnabled ? "ON" : "OFF", true); g_publishedBleEnabled = s.bleEnabled;
     logLine("pub", "ble link enabled=%d", s.bleEnabled);
   }
+  // The temperature control mode and the thermostat status do not depend on the Bluetooth link: publish them at once.
+  if ((int) s.controlMode != g_publishedControlMode) {
+    g_mqttClient.publish(TOPIC_CONTROL_MODE_STATE, controlModeText(s.controlMode), true); g_publishedControlMode = s.controlMode;
+    logLine("pub", "temperature control=%s", controlModeText(s.controlMode));
+  }
+  int thermostatCode = s.controlMode * 10 + s.thermostatState;
+  if (thermostatCode != g_publishedThermostat) {
+    g_mqttClient.publish(TOPIC_THERMOSTAT_STATE, thermostatStateText(s.controlMode, s.thermostatState), true); g_publishedThermostat = thermostatCode;
+    logLine("pub", "thermostat=%s", thermostatStateText(s.controlMode, s.thermostatState));
+  }
+  bool bridgeControl = s.controlMode != CONTROL_FIREPLACE;
+  if (bridgeControl && !hold && s.bridgeSetpoint != g_publishedSetpoint) {    // the bridge's own setpoint is known without a link, also with the heater off
+    char text[12]; snprintf(text, sizeof(text), "%d", s.bridgeSetpoint); g_mqttClient.publish(TOPIC_SETPOINT_STATE, text, true); g_publishedSetpoint = s.bridgeSetpoint;
+  }
   if (!s.valid) {                                           // no reading yet (e.g. after a restart): do not show old retained values
-    publishSetpointUnknown();
+    if (!bridgeControl) publishSetpointUnknown();
     if (g_publishedTemperatureTenths != SETPOINT_NONE) { g_mqttClient.publish(TOPIC_TEMPERATURE_STATE, "None", true); g_publishedTemperatureTenths = SETPOINT_NONE; }
     return;
   }
@@ -1145,14 +1425,14 @@ static void publishChanges(const SharedState &s) {
     char text[4]; snprintf(text, sizeof(text), "%u", s.flameLevel); g_mqttClient.publish(TOPIC_FLAME_LEVEL_STATE, text, true); g_publishedFlameLevel = s.flameLevel;
     logLine("pub", "level=%u", s.flameLevel);
   }
-  bool heaterOn = isHeaterOn(s);
+  bool heaterOn = isHeaterSwitchOn(s);                      // with bridge control: the user's wish, not the momentary state of the element
   if (!hold && (int) heaterOn != g_publishedHeater) { g_mqttClient.publish(TOPIC_HEATER_STATE, heaterOn ? "ON" : "OFF", true); g_publishedHeater = heaterOn; logLine("pub", "heater=%d", heaterOn); }
   int powerCode = (s.regHeaterPower == 0x01) ? 0 : (s.regHeaterPower == 0x03 ? 1 : 2);
   if (powerCode != g_publishedHeaterPower) {
     char text[12]; if (powerCode == 2) snprintf(text, sizeof(text), "raw %02x", s.regHeaterPower); else snprintf(text, sizeof(text), "%s", powerCode ? "high" : "low");
     g_mqttClient.publish(TOPIC_HEATER_POWER_STATE, text, true); g_publishedHeaterPower = powerCode;
   }
-  if (!hold) {
+  if (!hold && !bridgeControl) {                             // (with bridge control the setpoint was published above)
     if (heaterOn && s.setpoint > 0) {
       if (s.setpoint != g_publishedSetpoint) { char text[12]; snprintf(text, sizeof(text), "%d", s.setpoint); g_mqttClient.publish(TOPIC_SETPOINT_STATE, text, true); g_publishedSetpoint = s.setpoint; }
     } else if (!heaterOn) {
@@ -1250,11 +1530,12 @@ static bool awaitedTargetReached(AwaitedControl control, int target, const Share
   switch (control) {
     case AW_BLE:          return target ? (s.bleEnabled && s.ready) : !s.bleEnabled;
     case AW_EFFECT:       return (isFlameEffectOn(s) ? 1 : 0) == target;
-    case AW_HEATER:       return (isHeaterOn(s) ? 1 : 0) == target;
+    case AW_HEATER:       return (isHeaterSwitchOn(s) ? 1 : 0) == target;
     case AW_HEATER_POWER: return s.regHeaterPower == (target ? 0x03 : 0x01);
-    case AW_SETPOINT:     return s.setpoint == target;
+    case AW_SETPOINT:     return displayedSetpoint(s) == target;
     case AW_FLAME_LEVEL:  return s.flameLevel == target;
     case AW_VOLUME:       return s.volume == target;
+    case AW_CONTROL_MODE: return s.controlMode == target;
     default:              return true;
   }
 }
@@ -1308,6 +1589,37 @@ static String describeSample(const StatusSample &x) {
   if (!heating) return "effect F" + String(x.flameLevel);
   return String("heater ") + (x.heaterPower == 0x03 ? "high" : (x.heaterPower == 0x01 ? "low" : "?")) + " " + String(x.setpoint) + "&deg;C F" + String(x.flameLevel);
 }
+// Tenths of a degree as text: 213 -> "21.3".
+static String tenthsText(int tenths) {
+  char text[12]; snprintf(text, sizeof(text), "%s%d.%d", tenths < 0 ? "-" : "", abs(tenths) / 10, abs(tenths) % 10);
+  return text;
+}
+// A time span for the page: "42 s" or "5 min".
+static String formatAge(uint32_t ms) { return ms < 120000UL ? String(ms / 1000) + " s" : String(ms / 60000UL) + " min"; }
+// One or two lines under the Heater buttons that say what the bridge's thermostat is doing (empty without bridge control).
+static String buildThermostatStatus(const SharedState &s) {
+  if (s.controlMode == CONTROL_FIREPLACE) return "";
+  bool external = s.controlMode == CONTROL_EXTERNAL;
+  int setpointTenths = s.bridgeSetpoint * 10;
+  int offAbove = setpointTenths + (external ? s.thermo.externalOffAbove : s.thermo.internalOffAbove);
+  int onBelow  = setpointTenths - (external ? s.thermo.externalOnBelow  : s.thermo.internalOnBelow);
+  String now = s.controlTempValid ? " (now " + tenthsText(s.controlTempTenths) + "&deg;C)" : String("");
+  String h = "<p class=dim>Control: <b>" + String(controlModeText(s.controlMode)) + "</b>. ";
+  switch (s.thermostatState) {
+    case THERMO_HEATING:   h += "Heating: the heater switches off at " + tenthsText(offAbove) + "&deg;C" + now + "."; break;
+    case THERMO_SATISFIED: h += "Target reached: the heater is off and switches on again at " + tenthsText(onBelow) + "&deg;C or lower" + now + "."; break;
+    case THERMO_NO_SENSOR: {
+      int tenths; uint32_t ageMs;
+      h += readRoomTemperature(tenths, ageMs) ? "<b>No recent room temperature</b> (last one " + formatAge(ageMs) + " ago, limit " + String(s.thermo.timeoutMinutes) + " min)"
+                                              : String("<b>No room temperature received yet</b>");
+      h += ": the heater is off. It starts again by itself when a new value arrives on <i>" + String(TOPIC_ROOM_TEMPERATURE_SET) + "</i>.";
+      break;
+    }
+    default: h += "Heating is off. Press On to heat towards the setpoint."; break;
+  }
+  return h + "</p>";
+}
+
 // Number of commands that are queued or running.
 static uint32_t pendingCommands() { return uxQueueMessagesWaiting(g_commandQueue) + (g_commandRunning ? 1 : 0); }
 static String formatMs(uint32_t us) { return String(us / 1000.0, 1) + " ms"; }
@@ -1328,7 +1640,9 @@ static String buildLiveHeader(const SharedState &s, uint32_t pending) {
 // Live block of the Main page: Bluetooth link, flame effect, heater, setpoint and the internal temperature.
 static String buildMainLive(const SharedState &s) {
   bool ready = s.ready && s.valid;
-  bool effectOn = ready && isFlameEffectOn(s), heaterOn = ready && isHeaterOn(s);
+  bool bridgeControl = s.controlMode != CONTROL_FIREPLACE;
+  // heaterOn = what the Heater buttons show (with bridge control: the user's wish); heaterRunning = the heater of the fireplace is really on
+  bool effectOn = ready && isFlameEffectOn(s), heaterOn = ready && isHeaterSwitchOn(s), heaterRunning = ready && isHeaterOn(s);
   String h;
   // "Connected" is green only when the link is really up; while the bridge is still connecting it is orange, like any other
   // switch that is on its way (the fireplace can be slow or far away).
@@ -1346,14 +1660,31 @@ static String buildMainLive(const SharedState &s) {
   h += "<h3>Flame effect</h3>" + choiceButton("On", setHref("fx=on"), effectOn, AW_EFFECT, 1) + choiceButton("Off (all off)", setHref("fx=off"), ready && !effectOn, AW_EFFECT, 0);
 
   h += "<h3>Heater</h3>" + choiceButton("On", setHref("heater=on"), heaterOn, AW_HEATER, 1) + choiceButton("Off", setHref("heater=off"), ready && effectOn && !heaterOn, AW_HEATER, 0);
-  h += "<p class=dim>The heater can only be started while the flame effect is on.</p>";
+  h += bridgeControl ? buildThermostatStatus(s) : String("<p class=dim>The heater can only be started while the flame effect is on.</p>");
 
   h += "<h3>Setpoint</h3>";
-  if (heaterOn) {
-    h += linkButton("&minus;1", setHref("spd=-1"), false) + "<b class='big" + String(g_awaited[AW_SETPOINT].active ? " pending" : "") + "'>" + String(g_awaited[AW_SETPOINT].active ? g_awaited[AW_SETPOINT].target : s.setpoint) + "&deg;C</b> " + linkButton("+1", setHref("spd=1"), false);
+  if (bridgeControl || heaterRunning) {            // the bridge's own setpoint can be set at any time; the fireplace's only while its heater runs
+    int shown = displayedSetpoint(s);
+    h += linkButton("&minus;1", setHref("spd=-1"), false) + "<b class='big" + String(g_awaited[AW_SETPOINT].active ? " pending" : "") + "'>" + String(g_awaited[AW_SETPOINT].active ? g_awaited[AW_SETPOINT].target : shown) + "&deg;C</b> " + linkButton("+1", setHref("spd=1"), false);
     h += "<form action='/set' style='margin-top:6px'>Set: <input type=number name=sp min=" + String(s.setpointMin) + " max=" + String(s.setpointMax) +
-         " value=" + String(s.setpoint) + "> <button class=b>Apply</button> <span class=dim>(" + String(s.setpointMin) + "&ndash;" + String(s.setpointMax) + ")</span></form>";
+         " value=" + String(shown) + "> <button class=b>Apply</button> <span class=dim>(" + String(s.setpointMin) + "&ndash;" + String(s.setpointMax) + ")</span></form>";
+    if (bridgeControl) h += "<p class=dim>Setpoint of the bridge's control. It is saved in the bridge and also sent to the fireplace as back-up thermostat.</p>";
   } else h += "<p class=dim>Only available while the heater is on (the fireplace starts at 21&deg;C).</p>";
+
+  // Which temperature control is used. Changing it is a button press here; the margins and time-out are on the Settings page.
+  h += "<h3>Temperature control</h3>";
+  h += choiceButton("Fireplace thermostat", setHref("ctl=fireplace"), s.controlMode == CONTROL_FIREPLACE, AW_CONTROL_MODE, CONTROL_FIREPLACE) +
+       choiceButton("Room sensor (MQTT)", setHref("ctl=room"), s.controlMode == CONTROL_EXTERNAL, AW_CONTROL_MODE, CONTROL_EXTERNAL) +
+       choiceButton("Internal sensor", setHref("ctl=internal"), s.controlMode == CONTROL_INTERNAL, AW_CONTROL_MODE, CONTROL_INTERNAL);
+  h += "<p class=dim>Fireplace thermostat: the bridge only switches the heater on and off and the fireplace regulates (it does not do this reliably). "
+       "Room sensor: the bridge regulates on the room temperature it receives over MQTT. Internal sensor: the bridge regulates on the sensor inside the fireplace. Margins and time-out: Settings page.</p>";
+
+  if (s.controlMode == CONTROL_EXTERNAL) {
+    h += "<h3>Room temperature <span class=dim>(received over MQTT)</span></h3>";
+    int tenths; uint32_t ageMs;
+    if (readRoomTemperature(tenths, ageMs)) h += "<span class=big>" + tenthsText(tenths) + "&deg;C</span> <span class=dim>received " + formatAge(ageMs) + " ago</span>";
+    else h += "<p class=dim>Nothing received yet on <i>" + String(TOPIC_ROOM_TEMPERATURE_SET) + "</i>.</p>";
+  }
 
   h += "<h3>Temperature <span class=dim>(sensor inside the fireplace, not the room)</span></h3>";
   if (ready) h += "<span class=big>" + String(s.regTemperature[1]) + "." + String(s.regTemperature[2] % 10) + "&deg;C</span> <span class=dim>read " + String((millis() - s.lastReadMs) / 1000) + " s ago</span>";
@@ -1427,6 +1758,17 @@ static String buildDebugLive(const SharedState &s, uint32_t pending) {
     }
     h += "</table>";
   } else h += "<p class=dim>No data yet.</p>";
+
+  h += "<h3>Thermostat</h3><p class=dim>Control: <b>" + String(controlModeText(s.controlMode)) + "</b> &middot; status: " + thermostatStateText(s.controlMode, s.thermostatState);
+  if (s.controlMode != CONTROL_FIREPLACE) {
+    h += " &middot; heating wanted: " + String(s.thermostatWanted ? "yes" : "no") + " &middot; bridge setpoint " + String(s.bridgeSetpoint) + "&deg;C";
+    h += "<br>Temperature of the last decision: " + (s.controlTempValid ? tenthsText(s.controlTempTenths) + "&deg;C" : String("none")) +
+         " &middot; margins (tenths) room +" + String(s.thermo.externalOffAbove) + "/-" + String(s.thermo.externalOnBelow) +
+         ", internal +" + String(s.thermo.internalOffAbove) + "/-" + String(s.thermo.internalOnBelow) + " &middot; time-out " + String(s.thermo.timeoutMinutes) + " min";
+    int roomTenths; uint32_t roomAgeMs;
+    h += "<br>Room temperature (MQTT): " + (readRoomTemperature(roomTenths, roomAgeMs) ? tenthsText(roomTenths) + "&deg;C, " + formatAge(roomAgeMs) + " ago" : String("nothing received"));
+  }
+  h += "</p>";
 
   h += "<h3>Connections</h3><p class=dim>Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "not connected") +
        " &middot; MQTT: " + (g_mqttUp ? "connected" : "<b>not connected</b>") + " (" + String((uint32_t) g_mqttFailCount) + " failed attempts)" +
@@ -1503,9 +1845,20 @@ static void handleSettingsPage() {
   String form = "<form action='/set' style='margin-top:8px'>Address: <input type=text name=fpaddr value='" + htmlEscape(s.configuredAddress) +
                 "' placeholder='auto-detect' maxlength=17> Passkey: <input type=text name=pkey value='" + htmlEscape(s.passkeyText) +
                 "' maxlength=6 size=6 style='width:6em'><input type=hidden name=r value=settings> <button class=b>Save</button>"
-                "<br><span class=dim>Leave the address empty to find the fireplace automatically (by its name). The bridge reconnects after saving.</span></form>"
-                "<h3>Factory reset</h3><p class=dim>Erases all settings (Wi-Fi, MQTT, fireplace and passkey) and restarts the bridge in setup mode, like a physical reset button.</p>"
-                "<a class='b warn' href='/reset'>Factory reset&hellip;</a>";
+                "<br><span class=dim>Leave the address empty to find the fireplace automatically (by its name). The bridge reconnects after saving.</span></form>";
+  // Margins and time-out of the bridge's temperature control (the mode itself is chosen on the Main page). Shown in degrees, stored in tenths.
+  auto marginField = [&](const char *name, int tenths) {
+    return String("<input type=number name=") + name + " step=0.1 min=0 max=5 value=" + tenthsText(tenths) + "> ";
+  };
+  form += "<h3>Temperature control</h3><p class=dim>Active mode: <b>" + String(controlModeText(s.controlMode)) + "</b> (choose it on the Main page). "
+          "With bridge control the heater switches off when the temperature reaches the setpoint plus the first margin and on again when it has dropped to the setpoint minus the second margin.</p>"
+          "<form action='/set'>Room sensor (MQTT): off at setpoint + " + marginField("xoff", s.thermo.externalOffAbove) + "&deg;C, on at setpoint &minus; " + marginField("xon", s.thermo.externalOnBelow) + "&deg;C<br>"
+          "Internal sensor: off at setpoint + " + marginField("ioff", s.thermo.internalOffAbove) + "&deg;C, on at setpoint &minus; " + marginField("ion", s.thermo.internalOnBelow) + "&deg;C<br>"
+          "Room temperature time-out: <input type=number name=tmo min=1 max=240 value=" + String(s.thermo.timeoutMinutes) + "> minutes"
+          "<input type=hidden name=r value=settings> <button class=b>Save</button>"
+          "<br><span class=dim>Fail-safe for the room sensor: when no room temperature has arrived for this long, the heater is switched off. It starts again by itself when a new value arrives.</span></form>";
+  form += "<h3>Factory reset</h3><p class=dim>Erases all settings (Wi-Fi, MQTT, fireplace, passkey and temperature control) and restarts the bridge in setup mode, like a physical reset button.</p>"
+          "<a class='b warn' href='/reset'>Factory reset&hellip;</a>";
   sendPage(PAGE_SETTINGS, form);
 }
 // Debug page.
@@ -1581,13 +1934,25 @@ static void handleSet() {
     if (ok) awaitControl(control, target); else queued = false;
   };
   const SharedState &now = g_webSnapshot;               // last state shown to the page (for the +/- setpoint buttons)
+  auto currentSetpoint = [&]() { return g_awaited[AW_SETPOINT].active ? g_awaited[AW_SETPOINT].target : displayedSetpoint(now); };
   auto clampSetpoint = [&](int degrees) { return degrees < now.setpointMin ? now.setpointMin : (degrees > now.setpointMax ? now.setpointMax : degrees); };
   if (g_webServer.hasArg("ble"))    { bool on = g_webServer.arg("ble") != "off"; request(on ? CMD_BLE_RESUME : CMD_BLE_RELEASE, 0, AW_BLE, on); }
   if (g_webServer.hasArg("fx"))     { bool on = g_webServer.arg("fx") == "on"; request(CMD_FLAME_EFFECT, on, AW_EFFECT, on); }
   if (g_webServer.hasArg("heater")) { bool on = g_webServer.arg("heater") == "on"; request(CMD_HEATER, on, AW_HEATER, on); }
   if (g_webServer.hasArg("hpwr"))   { bool high = g_webServer.arg("hpwr") == "high"; request(CMD_HEATER_POWER, high, AW_HEATER_POWER, high); }
   if (g_webServer.hasArg("sp"))     { int degrees = g_webServer.arg("sp").toInt(); request(CMD_SETPOINT, degrees, AW_SETPOINT, clampSetpoint(degrees)); }
-  if (g_webServer.hasArg("spd"))    { int delta = g_webServer.arg("spd").toInt(); request(CMD_SETPOINT_DELTA, delta, AW_SETPOINT, clampSetpoint((g_awaited[AW_SETPOINT].active ? g_awaited[AW_SETPOINT].target : now.setpoint) + delta)); }
+  if (g_webServer.hasArg("spd"))    { int delta = g_webServer.arg("spd").toInt(); request(CMD_SETPOINT_DELTA, delta, AW_SETPOINT, clampSetpoint(currentSetpoint() + delta)); }
+  if (g_webServer.hasArg("ctl")) {                                                                 // temperature control: fireplace thermostat / room sensor (MQTT) / internal sensor
+    String choice = g_webServer.arg("ctl");
+    ControlMode mode = choice == "room" ? CONTROL_EXTERNAL : (choice == "internal" ? CONTROL_INTERNAL : CONTROL_FIREPLACE);
+    request(CMD_CONTROL_MODE, mode, AW_CONTROL_MODE, mode);
+  }
+  if (g_webServer.hasArg("tmo")) {                                                                 // margins and time-out form on the Settings page (degrees -> tenths)
+    auto tenthsOf = [&](const char *name) { return (int) lroundf(g_webServer.arg(name).toFloat() * 10.0f); };
+    int values[5] = { tenthsOf("xoff"), tenthsOf("xon"), tenthsOf("ioff"), tenthsOf("ion"), g_webServer.arg("tmo").toInt() };
+    stageThermostatSettings(values);                                                               // the BLE task validates and applies them
+    queued &= queueCommand(CMD_APPLY_THERMOSTAT, 0, SOURCE_WEB);
+  }
   if (g_webServer.hasArg("flame"))  { int n = g_webServer.arg("flame").toInt(); n = n < 1 ? 1 : (n > 6 ? 6 : n); request(CMD_FLAME_LEVEL, n, AW_FLAME_LEVEL, n); }
   if (g_webServer.hasArg("vol"))    { int n = g_webServer.arg("vol").toInt();   n = n < 0 ? 0 : (n > 6 ? 6 : n); request(CMD_VOLUME, n, AW_VOLUME, n); }
   if (g_webServer.hasArg("scan"))   queued &= queueCommand(CMD_SCAN, 0, SOURCE_WEB);

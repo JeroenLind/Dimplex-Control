@@ -103,20 +103,23 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 |---|---|---|
 | `dimplex/power/set` | `ON` / `OFF` | Flame effect on; `OFF` switches everything off, the heater included |
 | `dimplex/heater/set` | `ON` / `OFF` | Heater on (only works while the flame effect is on) or off |
-| `dimplex/setpoint/set` | degrees, e.g. `21` | Setpoint, rounded and clamped to the limits; only while the heater is on |
+| `dimplex/setpoint/set` | degrees, e.g. `21` | Setpoint, rounded and clamped to the limits. Mode "Fireplace thermostat": the fireplace's setpoint, only while the heater is on. Bridge modes: the bridge's own setpoint, at any time |
 | `dimplex/level/set` | `1` to `6` | Flame level |
 | `dimplex/ble/set` | `ON` / `OFF` | `ON` = bridge holds the Bluetooth link; `OFF` = release it for the remote |
+| `dimplex/room_temperature/set` | degrees, e.g. `21.3` | Room temperature for the control mode "Room sensor (MQTT)". Plain number only; anything else is ignored. Publish without retain. Subscribed in every mode, only used in that mode |
 
 **State topics (published, retained):**
 
 | Topic | Values | Notes |
 |---|---|---|
 | `dimplex/power/state` | `ON` / `OFF` | Flame effect |
-| `dimplex/heater/state` | `ON` / `OFF` | |
-| `dimplex/setpoint/state` | degrees or `None` | `None` (unknown in Home Assistant) while the heater is off or before the first reading |
+| `dimplex/heater/state` | `ON` / `OFF` | In a bridge mode: the user's wish for heating, not the momentary state of the element (so it stays `ON` while the target is reached) |
+| `dimplex/setpoint/state` | degrees or `None` | Mode "Fireplace thermostat": `None` (unknown in Home Assistant) while the heater is off or before the first reading. Bridge modes: always the bridge setpoint |
 | `dimplex/level/state` | `1` to `6` | |
 | `dimplex/heater_power/state` | `low` / `high` / `raw xx` | |
 | `dimplex/temperature/state` | e.g. `21.5` or `None` | Internal sensor, published only when it changed by at least 0.2 °C (deadband) |
+| `dimplex/control_mode/state` | text | Selected temperature control: `Fireplace thermostat`, `Room sensor (MQTT)`, `Internal sensor` (retained). Changed on the web page only |
+| `dimplex/thermostat/state` | text | `heating`, `target reached`, `no room temperature`, `off`, `not used` (retained) |
 | `dimplex/ble/state` | `ON` / `OFF` | Also published while the link is released |
 | `dimplex/raw/state` | text | Raw register values for diagnostics |
 | `dimplex/diag/state` | JSON | Health values (restart reason, uptime, memory, signal, counters); published after connecting and then every 60 s |
@@ -134,6 +137,8 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | Flame intensity state | sensor | `dimplex_levelstate` |
 | Heater power | sensor | `dimplex_heater_power` |
 | Internal temperature | sensor | `dimplex_temperature` |
+| Temperature control | sensor | `dimplex_control_mode` |
+| Thermostat status | sensor | `dimplex_thermostat` |
 | Raw registers | sensor (diagnostic) | `dimplex_raw` |
 | Last restart reason, Restart count, Uptime, Free memory, Lowest free memory, Wi-Fi signal, Wi-Fi drops, Last Wi-Fi outage, Bluetooth connections, MQTT connect failures, Free stack BLE task, Free stack MQTT task | sensors (diagnostic), all read from `dimplex/diag/state` | `dimplex_diag_restart_reason`, `dimplex_diag_restart_count`, `dimplex_diag_uptime`, `dimplex_diag_free_heap`, `dimplex_diag_min_heap`, `dimplex_diag_wifi`, `dimplex_diag_wifi_drops`, `dimplex_diag_wifi_outage`, `dimplex_diag_ble_connects`, `dimplex_diag_mqtt_failures`, `dimplex_diag_stack_ble`, `dimplex_diag_stack_mqtt` |
 
@@ -147,11 +152,11 @@ Served by the Arduino `WebServer` on port 80 from `loop()`.
 
 | Path | Purpose |
 |---|---|
-| `/` | Main page: Bluetooth link, flame effect, heater, setpoint, internal temperature |
-| `/settings` | Settings page: flame level, heater power, volume, fireplace selection (scan, address, passkey), factory reset |
+| `/` | Main page: Bluetooth link, flame effect, heater, setpoint, temperature control mode, thermostat status, room temperature (room sensor mode), internal temperature |
+| `/settings` | Settings page: flame level, heater power, volume, fireplace selection (scan, address, passkey), margins and time-out of the temperature control, factory reset |
 | `/debug` | Debug page: raw registers, temperature history, CSV download, system information, restart |
 | `/live?p=<page>` | Only the live block of a page (HTML fragment); polled by the page script |
-| `/set?...` | Actions. Parameters: `ble=on/off`, `fx=on/off`, `heater=on/off`, `hpwr=low/high`, `sp=<deg>`, `spd=<+/-1>`, `flame=1..6`, `vol=0..6`, `scan=1`, `fpaddr=<mac or auto>`, `pkey=<digits>`, `diag=reset`, `restart=1`, `factory=confirm`, plus `r=<page>` for the page to return to |
+| `/set?...` | Actions. Parameters: `ctl=fireplace/room/internal` (temperature control mode), `xoff`, `xon`, `ioff`, `ion` (margins in degrees) with `tmo` (time-out in minutes), `ble=on/off`, `fx=on/off`, `heater=on/off`, `hpwr=low/high`, `sp=<deg>`, `spd=<+/-1>`, `flame=1..6`, `vol=0..6`, `scan=1`, `fpaddr=<mac or auto>`, `pkey=<digits>`, `diag=reset`, `restart=1`, `factory=confirm`, plus `r=<page>` for the page to return to |
 | `/reset` | Confirmation page for the factory reset |
 | `/csv`, `/csv?download=1` | Status log as text or as a file (`dimplex-status-log.csv`) |
 | `/manifest.webmanifest`, `/sw.js`, `/icon-192.png`, `/icon-512.png` | Web app manifest, service worker and icons, so the page can be installed as an app (below) |
@@ -198,8 +203,12 @@ Namespace `cfg`:
 | `pkey` | Pairing passkey as text |
 | `detaddr` | Address found by the last auto-detect |
 | `boots` | Number of starts (restart count) |
+| `ctlmode` | Temperature control mode (0 fireplace, 1 room sensor, 2 internal sensor) |
+| `bsetp` | Setpoint of the bridge's control (15 to 30) |
+| `xoff`, `xon`, `ioff`, `ion` | Margins in tenths of a degree: room sensor off / on, internal sensor off / on |
+| `tmo` | Room temperature time-out in minutes |
 
-The Wi-Fi credentials are stored by WiFiManager itself. A factory reset clears this namespace and the Wi-Fi credentials, then restarts into the setup portal.
+The Wi-Fi credentials are stored by WiFiManager itself. A factory reset clears this namespace (temperature control settings included) and the Wi-Fi credentials, then restarts into the setup portal.
 
 ---
 
@@ -223,7 +232,7 @@ One file, `Dimplex-Control.ino`, in numbered sections:
 | 8. LEDs | `ledTask` |
 | 9. Setup | Setup portal, `setup()`, `loop()` |
 
-A second file, `icons.h`, in the same folder holds the app icons as PNG byte arrays.
+Two more files in the same folder: `icons.h` holds the app icons as PNG byte arrays, and `thermostat.h` holds the types and the decision logic of the temperature control (section 5.5). `thermostat.h` is plain C++ without Arduino calls, so `test/thermostat_test.cpp` can test it on a PC.
 
 All types (`struct`, `enum`) are defined above the first function. The Arduino IDE inserts automatic function prototypes before the first function, so a type defined after it breaks the build with errors like "does not name a type".
 
@@ -287,6 +296,9 @@ Command types: flame effect, heater, heater power, setpoint, setpoint delta (the
 | Constant | Value | Meaning |
 |---|---|---|
 | `FIREPLACE_POLL_INTERVAL_MS` | 5000 | Register polling |
+| `THERMOSTAT_INTERVAL_MS` | 1000 | How often `bleTask` runs the thermostat (it only switches when the decision changes) |
+| room temperature time-out | 15 min (1 to 240, setting) | Fail-safe of the room sensor mode |
+| thermostat retry | 30 s | After a heater switch that was not confirmed; the setpoint sync retries every 15 s |
 | `BLE_RETRY_INTERVAL_MS` | 5000 | Pause between connect attempts |
 | connect timeout | 5000 | One BLE connect attempt |
 | scan duration | 4000 | One BLE scan |
@@ -343,6 +355,27 @@ Loop: without Wi-Fi wait; without a known broker address resolve it; if not conn
 
 ### 5.4 LED task
 Sets the pins every 50 ms from `WiFi.status()` and a few `volatile` flags. It does not take the mutex.
+
+### 5.5 Temperature control (thermostat)
+Issue #1: the fireplace's own thermostat kept the element running above the setpoint (section 11), so the bridge can regulate itself. The decision is in `thermostat.h` (`decideThermostat()`); the switching is in `runThermostat()` in `bleTask`, called once a second while the link is ready. Everything runs in `bleTask`, so the ownership rules (4.2) are unchanged.
+
+**Modes** (`ControlMode`, stored in flash, chosen with `ctl=` on the Main page):
+
+| Mode | Temperature used | Heater switch means |
+|---|---|---|
+| Fireplace thermostat | none | The element is switched physically, as before. The fireplace regulates. |
+| Room sensor (MQTT) | last value on `dimplex/room_temperature/set` | "I want heating" (`g_thermostatWanted`); the bridge switches the element |
+| Internal sensor | register `0x0055`, read in the same poll round | the same |
+
+**Hysteresis.** Off when the temperature reaches setpoint + off-margin; on again when it is at or below setpoint - on-margin. The first decision after the user switches on, after a mode change or after a sensor time-out is a *start*: heat while below the setpoint. Defaults: room sensor +0.3 / -0.3 °C, internal sensor +1.0 / -0.2 °C (the internal sensor reads high while heating, see the issue and section 11). Margins are 0 to 5.0 °C with at least 0.2 °C band in total, so the element cannot flutter.
+
+**Fail-safe.** In the room sensor mode, when no valid value has arrived within the time-out (or none since boot), the state is `no room temperature` and the heater is switched off. The wish stays, so a new value restarts the heating without a user action. A rejected MQTT payload (not a number, out of range) does not refresh the timer. If the internal sensor cannot be read for one round, nothing is changed that round.
+
+**Taking over.** A heater found running without a wish (started with the remote, or after a bridge restart) is taken over by the control. The fireplace is switched off, or the Bluetooth link released: the wish is cleared.
+
+**Setpoint.** In a bridge mode the setpoint is the bridge's own (`bsetp`, flash). It is also written to the fireplace after the heater has started (the fireplace starts at 21 every time), so the fireplace's own thermostat acts as a back-up if the bridge fails. A write that is not confirmed is tried again after 15 s. `dimplex/setpoint/state` then always shows the bridge setpoint.
+
+**Switching the element.** A failed or unconfirmed switch is retried after 30 s, not every second.
 
 ---
 
@@ -439,6 +472,11 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Buttons show "waiting" until confirmed | A command takes about a second. Without feedback it looks as if nothing happened. |
 | Timestamps through one helper | A mix of timestamped and plain lines made the log hard to read. |
 | Settings in NVS, set up through a captive portal | No credentials in the source needed for normal use, and no re-flash to change the broker or fireplace. |
+| Thermostat in the bridge, in `bleTask` | The fireplace's own thermostat is unreliable. The bridge already owns the BLE link, so the control needs no new task and no new locking. |
+| Decision logic in `thermostat.h` | It has no hardware calls, so the hysteresis and the fail-safe are tested on a PC. |
+| Heater switch = wish in bridge modes | The element is off for part of the time; if the switch followed the element, Home Assistant would flip the switch off every cycle. |
+| Fail-safe turns the heater off, not the whole fireplace | The flame effect is harmless; only the heating depends on a sensor value. |
+| Control mode only on the web page | The issue asks for the web interface to choose it; Home Assistant shows it read-only. |
 | Everything in one sketch file | Simple for the Arduino IDE and for readers. The numbered sections keep it navigable. |
 
 ---
@@ -457,6 +495,8 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Write not confirmed | `state NOT confirmed` in the log. The next poll shows the real state. |
 | Invalid fireplace address or passkey | Not saved; a message says why. |
 | NTP not yet available | The clock write is postponed and retried every 2 s. |
+| No room temperature (room sensor mode) | No valid value for the time-out: the heater is switched off, the page and Home Assistant show "no room temperature". A new valid value restarts the heating by itself while the user's wish is still on. |
+| Heater switch not confirmed (bridge mode) | The thermostat tries again after 30 s instead of every second. |
 | Watchdog | Every task loop yields, so the watchdog is not starved. |
 
 ---
@@ -477,6 +517,7 @@ Dimplex Control is meant for a trusted home network. Known limits:
 ## 10. Testing
 
 - **Simulation on a PC.** The sketch is compiled with `g++ -Wall -Wextra` against stub versions of the Arduino, WiFi, WebServer, NimBLE, PubSubClient and related headers, with a simulated fireplace (optionally slow to report changes), a simulated broker and a simulated web client. About 90 checks cover: command execution and ordering, the web pages and live block, button feedback, fireplace selection and validation, factory reset, MQTT discovery and commands, the echo without flicker against a fireplace that needs 1.5 s, the deadband, Bluetooth release and resume, the LED states, a broker that does not answer, a lost BLE link in the middle of a command, and the crash diagnostics (previous session log, restart reason, planned restart, health sensors) and the Wi-Fi watchdog (with shortened delays).
+- **Unit test of the thermostat.** `test/thermostat_test.cpp` tests `thermostat.h` without stubs (hysteresis for both sensors, start rule, fail-safe and recovery, settings validation, parsing of MQTT payloads): `g++ -std=c++17 -Wall -Wextra -I Dimplex-Control test/thermostat_test.cpp -o thermostat_test && ./thermostat_test`.
 - **Measured in the simulation:** the slowest web request stayed in the order of a few milliseconds while BLE and MQTT were blocked.
 - **Not tested:** the real ESP32, the real NimBLE and Wi-Fi coexistence timing, the stack sizes, Home Assistant itself, and long-term behaviour (heap over 24 hours). The first real test of each of those is on the hardware. The Debug page shows the numbers needed (loop gap, request time, free stack, free heap).
 - **Acceptance criteria** that were defined for the task layout (response time, no resets, no leaks, ordered commands, recovery) are in `task-architecture.md`, section 7.
@@ -487,7 +528,7 @@ Dimplex Control is meant for a trusted home network. Known limits:
 
 | Topic | Notes |
 |---|---|
-| Thermostat behaviour | In one measured run the heating element kept running while the internal sensor (`0x0055`) was 1.2 °C above the setpoint. The fireplace probably regulates on a different sensor. See `experiments.md`. The bridge shows `0x0055` as "internal temperature", not as room temperature. |
+| Thermostat behaviour | Issue #1 addresses this with the temperature control in the bridge (section 5.5). In one measured run the heating element kept running while the internal sensor (`0x0055`) was 1.2 °C above the setpoint. The fireplace probably regulates on a different sensor. See `experiments.md`. The bridge shows `0x0055` as "internal temperature", not as room temperature. |
 | Radio sharing | Wi-Fi and Bluetooth share the radio on the ESP32. While the bridge scans or connects, web responses can be slower by tens to hundreds of milliseconds. |
 | Time zone | Fixed in `loop()` (Central European Time). Change the TZ string for other regions. |
 | Single fireplace | One address, one BLE link. |
@@ -496,7 +537,7 @@ Dimplex Control is meant for a trusted home network. Known limits:
 | Web feedback for MQTT commands | Only commands from the web page mark buttons as waiting. Commands from MQTT or the remote show only the "Working" line. |
 | Authentication | None on the web interface (section 9). |
 | HTTPS | The bridge serves plain HTTP only. Chrome on Android therefore needs a flag or a reverse proxy to install the app (section 3.4). |
-| Other ideas | Over-the-air updates (see the reminders below); a settings page for MQTT and time zone (now only in the portal and in the source); a second sensor reading for the room temperature; a program or timer function (the weekly timer registers are documented in `register-map.md` but not used). |
+| Other ideas | Over-the-air updates (see the reminders below); a settings page for MQTT and time zone (now only in the portal and in the source); a control mode that can be chosen from Home Assistant; a configurable topic for the room temperature; a program or timer function (the weekly timer registers are documented in `register-map.md` but not used). |
 
 ### Reminders: debugging in the field (not implemented yet)
 
