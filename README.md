@@ -7,9 +7,10 @@ Built and tested on a **Dimplex Engine 56/600** (Pro Range, ENG56-600, firmware 
 ## Features
 
 - **Fireplace control:** flame effect on/off, flame level F1–F6, heater on/off, setpoint, heater power low/high (0.9 / 1.8 kW).
+- **Temperature control in the bridge:** the fireplace's own thermostat does not regulate reliably, so the bridge can do it itself, with hysteresis. Three modes, chosen on the Main page: *Fireplace thermostat* (the bridge only switches the heater on and off), *Room sensor (MQTT)* and *Internal sensor*. See "Temperature control" below.
 - **Web interface** at `http://dimplex-control.local/` with three pages:
-  - **Main:** Bluetooth link, flame effect, heater, setpoint and the internal temperature.
-  - **Settings:** flame level, heater power, volume (models with sound), choosing the fireplace (scan or enter the address and passkey) and a factory reset.
+  - **Main:** Bluetooth link, flame effect, heater, setpoint, temperature control mode and the internal temperature.
+  - **Settings:** flame level, heater power, volume (models with sound), choosing the fireplace (scan or enter the address and passkey), margins and time-out of the temperature control, and a factory reset.
   - **Debug:** CSV status log download, raw registers, temperature history, connection and system information.
 - **MQTT with Home Assistant auto-discovery:** switches for the fireplace, heater and Bluetooth link, numbers for flame level and setpoint, and sensors for heater power, internal temperature and raw registers.
 - **Responsive:** web, BLE and MQTT run in separate FreeRTOS tasks, so a slow broker or a fireplace that is out of range does not freeze the page.
@@ -66,9 +67,29 @@ If your phone cannot resolve `dimplex-control.local`, use the bridge's IP addres
 
 The onboard LED on GPIO 2 is used; many ESP32 boards have one. Set `LED_PIN_WIFI`, `LED_PIN_MQTT` and `LED_PIN_BLE` at the top of the sketch for one external LED per connection.
 
+## Temperature control
+
+The Main page has three modes:
+
+| Mode | What the bridge does |
+|---|---|
+| **Fireplace thermostat** (default) | Nothing special: the heater is switched on and off, the fireplace regulates itself. The setpoint is the fireplace's setpoint. |
+| **Room sensor (MQTT)** | The bridge regulates on a room temperature it receives over MQTT. |
+| **Internal sensor** | The bridge regulates on the sensor inside the fireplace. |
+
+In the two bridge modes the heater switches **off** when the temperature reaches the setpoint plus a margin and **on** again when it has dropped to the setpoint minus a margin (hysteresis). Defaults: room sensor +0.3 / -0.3 °C; internal sensor +1.0 / -0.2 °C (the internal sensor lags, so it needs a wider band). Margins and the time-out are on the Settings page. The **Heater** switch (web and Home Assistant) means "I want heating": the heater may be off for a while because the temperature was reached, and the switch stays on. The line under the buttons shows what the thermostat is doing.
+
+- **Setpoint:** in a bridge mode the setpoint is the bridge's own, saved in flash (it survives a restart and power loss, and can be set with the heater off). The same value is also written to the fireplace as a back-up thermostat.
+- **Room temperature over MQTT:** publish the temperature in degrees as a plain number (for example `21.3`) to `dimplex/room_temperature/set`, **without retain**. Values that are not a number (`unavailable`, `21,5`, `21.5 C`) or are outside -30 to 60 °C are ignored and do not count as a new reading. Example Home Assistant automation: trigger on a state change of your room temperature sensor, action *mqtt.publish* with `topic: dimplex/room_temperature/set` and `payload: "{{ states('sensor.living_room_temperature') }}"`.
+- **Fail-safe:** if no valid room temperature has arrived for the time-out (default 15 minutes, 1 to 240 on the Settings page), or none since the bridge started, the heater is switched off and the page says why. When a new temperature arrives the control continues by itself, until you switch the heater off.
+- A heater that is running when no one asked for it (started with the remote, or after a restart of the bridge) is taken over by the control, so it never runs unregulated. Releasing the Bluetooth link ends the control.
+- Home Assistant gets two extra sensors: *Temperature control* (the mode) and *Thermostat status* (`heating`, `target reached`, `no room temperature`, `off`, `not used`).
+
+The fireplace's own thermostat and safety cut-outs stay active in all modes. Do not rely on the bridge for safety.
+
 ## About the temperature
 
-The temperature the fireplace reports comes from a sensor **inside the fireplace**, not from the room. It rises quickly when the heater runs and keeps rising for a while after it is switched off. The fireplace has no room sensor, so do not use this value as the room temperature of a thermostat.
+The temperature the fireplace reports comes from a sensor **inside the fireplace**, not from the room. It rises quickly when the heater runs and keeps rising for a while after it is switched off. The fireplace has no room sensor, so use this value as the room temperature only through the *Internal sensor* mode, which accepts that it lags; for real room control use the *Room sensor (MQTT)* mode.
 
 ## Documentation
 
