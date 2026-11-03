@@ -154,8 +154,8 @@ Served by the Arduino `WebServer` on port 80 from `loop()`.
 
 | Path | Purpose |
 |---|---|
-| `/` | Main page: Bluetooth link, flame effect, heater, setpoint, temperature control mode, thermostat status, room temperature (room sensor mode), internal temperature |
-| `/settings` | Settings page: flame level, heater power, volume, fireplace selection (scan, address, passkey), margins and time-out of the temperature control, factory reset |
+| `/` | Main page: Bluetooth link, flame effect, heating, setpoint, thermostat status, room temperature (room sensor mode), internal temperature |
+| `/settings` | Settings page: flame level, heater power, temperature control mode with margins and time-out, volume, fireplace selection (scan, address, passkey), factory reset |
 | `/debug` | Debug page: raw registers, temperature history, CSV download, system information, restart |
 | `/live?p=<page>` | Only the live block of a page (HTML fragment); polled by the page script |
 | `/set?...` | Actions. Parameters: `ctl=fireplace/room/internal` (temperature control mode), `xoff`, `xon`, `ioff`, `ion` (margins in degrees) with `tmo` (time-out in minutes), `ble=on/off`, `fx=on/off`, `heater=on/off`, `hpwr=low/high`, `sp=<deg>`, `spd=<+/-1>`, `flame=1..6`, `vol=0..6`, `scan=1`, `fpaddr=<mac or auto>`, `pkey=<digits>`, `diag=reset`, `restart=1`, `factory=confirm`, plus `r=<page>` for the page to return to |
@@ -361,7 +361,7 @@ Sets the pins every 50 ms from `WiFi.status()` and a few `volatile` flags. It do
 ### 5.5 Temperature control (thermostat)
 Issue #1: the fireplace's own thermostat kept the element running above the setpoint (section 11), so the bridge can regulate itself. The decision is in `thermostat.h` (`decideThermostat()`); the switching is in `runThermostat()` in `bleTask`, called once a second while the link is ready. Everything runs in `bleTask`, so the ownership rules (4.2) are unchanged.
 
-**Modes** (`ControlMode`, stored in flash, chosen with `ctl=` on the Main page):
+**Modes** (`ControlMode`, stored in flash, chosen with `ctl=` on the Settings page):
 
 | Mode | Temperature used | Heater switch means |
 |---|---|---|
@@ -478,7 +478,7 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Decision logic in `thermostat.h` | It has no hardware calls, so the hysteresis and the fail-safe are tested on a PC. |
 | Heater switch = wish in bridge modes | The element is off for part of the time; if the switch followed the element, Home Assistant would flip the switch off every cycle. The real state of the element is published separately on `dimplex/heater_element/state`. |
 | Fail-safe turns the heater off, not the whole fireplace | The flame effect is harmless; only the heating depends on a sensor value. |
-| Control mode only on the web page | The issue asks for the web interface to choose it; Home Assistant shows it read-only. |
+| Control mode only on the web page (Settings) | The issue asks for the web interface to choose it; it is a setting rather than a daily control, so it sits with the margins; Home Assistant shows it read-only. |
 | Everything in one sketch file | Simple for the Arduino IDE and for readers. The numbered sections keep it navigable. |
 
 ---

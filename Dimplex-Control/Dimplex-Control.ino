@@ -11,7 +11,7 @@
  *     setpoint number, Bluetooth link switch (release the link so the original remote can connect), plus read-only sensors (heater power, internal temperature, raw registers).
  *   - Temperature control in the bridge (see thermostat.h): the bridge can regulate the heater itself, on a room temperature
  *     that arrives over MQTT (dimplex/room_temperature/set) or on the sensor inside the fireplace, with hysteresis, a
- *     fail-safe time-out for the room temperature and a setpoint that is saved in flash. The mode is chosen on the Main page.
+ *     fail-safe time-out for the room temperature and a setpoint that is saved in flash. The mode is chosen on the Settings page.
  *   - Status LED(s): see "LED STATUS" below.
  *   - Volume (register 0x0076) is only offered on the Settings page, for models with a sound effect; it is not
  *     part of MQTT or the status log. See register-map.md.
@@ -1664,7 +1664,7 @@ static String buildMainLive(const SharedState &s) {
 
   h += "<h3>Flame effect</h3>" + choiceButton("On", setHref("fx=on"), effectOn, AW_EFFECT, 1) + choiceButton("Off (all off)", setHref("fx=off"), ready && !effectOn, AW_EFFECT, 0);
 
-  h += "<h3>Heater</h3>" + choiceButton("On", setHref("heater=on"), heaterOn, AW_HEATER, 1) + choiceButton("Off", setHref("heater=off"), ready && effectOn && !heaterOn, AW_HEATER, 0);
+  h += "<h3>Heating</h3>" + choiceButton("On", setHref("heater=on"), heaterOn, AW_HEATER, 1) + choiceButton("Off", setHref("heater=off"), ready && effectOn && !heaterOn, AW_HEATER, 0);
   h += bridgeControl ? buildThermostatStatus(s) : String("<p class=dim>The heater can only be started while the flame effect is on.</p>");
 
   h += "<h3>Setpoint</h3>";
@@ -1675,14 +1675,6 @@ static String buildMainLive(const SharedState &s) {
          " value=" + String(shown) + "> <button class=b>Apply</button> <span class=dim>(" + String(s.setpointMin) + "&ndash;" + String(s.setpointMax) + ")</span></form>";
     if (bridgeControl) h += "<p class=dim>Setpoint of the bridge's control. It is saved in the bridge and also sent to the fireplace as back-up thermostat.</p>";
   } else h += "<p class=dim>Only available while the heater is on (the fireplace starts at 21&deg;C).</p>";
-
-  // Which temperature control is used. Changing it is a button press here; the margins and time-out are on the Settings page.
-  h += "<h3>Temperature control</h3>";
-  h += choiceButton("Fireplace thermostat", setHref("ctl=fireplace"), s.controlMode == CONTROL_FIREPLACE, AW_CONTROL_MODE, CONTROL_FIREPLACE) +
-       choiceButton("Room sensor (MQTT)", setHref("ctl=room"), s.controlMode == CONTROL_EXTERNAL, AW_CONTROL_MODE, CONTROL_EXTERNAL) +
-       choiceButton("Internal sensor", setHref("ctl=internal"), s.controlMode == CONTROL_INTERNAL, AW_CONTROL_MODE, CONTROL_INTERNAL);
-  h += "<p class=dim>Fireplace thermostat: the bridge only switches the heater on and off and the fireplace regulates (it does not do this reliably). "
-       "Room sensor: the bridge regulates on the room temperature it receives over MQTT. Internal sensor: the bridge regulates on the sensor inside the fireplace. Margins and time-out: Settings page.</p>";
 
   if (s.controlMode == CONTROL_EXTERNAL) {
     h += "<h3>Room temperature <span class=dim>(received over MQTT)</span></h3>";
@@ -1697,7 +1689,7 @@ static String buildMainLive(const SharedState &s) {
   return h;
 }
 
-// Live block of the Settings page: flame level, heater power, volume and the fireplace selection (with the scan result).
+// Live block of the Settings page: flame level, heater power, temperature control mode, volume and the fireplace selection (with the scan result).
 static String buildSettingsLive(const SharedState &s) {
   bool ready = s.ready && s.valid;
   int level = s.flameLevel < 1 ? 1 : s.flameLevel;
@@ -1708,6 +1700,15 @@ static String buildSettingsLive(const SharedState &s) {
   h += choiceButton("Low (0.9 kW)", setHref("hpwr=low"), ready && s.regHeaterPower == 0x01, AW_HEATER_POWER, 0) + choiceButton("High (1.8 kW)", setHref("hpwr=high"), ready && s.regHeaterPower == 0x03, AW_HEATER_POWER, 1);
   h += "<p class=dim>Can only be changed while the heater is on. The fireplace remembers the setting.</p>";
   if (ready && s.regHeaterPower != 0x01 && s.regHeaterPower != 0x03) h += "<p class=dim>Register 0x0048 = " + String(s.regHeaterPower, HEX) + "</p>";
+
+  // Which temperature control is used (a button press); the margins and time-out are in the form below on this page.
+  h += "<h3>Temperature control</h3>";
+  h += choiceButton("Fireplace thermostat", setHref("ctl=fireplace"), s.controlMode == CONTROL_FIREPLACE, AW_CONTROL_MODE, CONTROL_FIREPLACE) +
+       choiceButton("Room sensor (MQTT)", setHref("ctl=room"), s.controlMode == CONTROL_EXTERNAL, AW_CONTROL_MODE, CONTROL_EXTERNAL) +
+       choiceButton("Internal sensor", setHref("ctl=internal"), s.controlMode == CONTROL_INTERNAL, AW_CONTROL_MODE, CONTROL_INTERNAL);
+  h += "<p class=dim>Fireplace thermostat: the bridge only switches the heater on and off and the fireplace regulates (it does not do this reliably). "
+       "Room sensor: the bridge regulates on the room temperature it receives over MQTT. Internal sensor: the bridge regulates on the sensor inside the fireplace. Margins and time-out: below.</p>";
+
 
   h += "<h3>Volume</h3>" + linkButtonRow("vol", AW_VOLUME, ready ? s.volume : -1, 0, 6);
   h += "<p class=dim>Only for models with a sound effect; has no effect on fireplaces without sound.</p>";
@@ -1851,11 +1852,11 @@ static void handleSettingsPage() {
                 "' placeholder='auto-detect' maxlength=17> Passkey: <input type=text name=pkey value='" + htmlEscape(s.passkeyText) +
                 "' maxlength=6 size=6 style='width:6em'><input type=hidden name=r value=settings> <button class=b>Save</button>"
                 "<br><span class=dim>Leave the address empty to find the fireplace automatically (by its name). The bridge reconnects after saving.</span></form>";
-  // Margins and time-out of the bridge's temperature control (the mode itself is chosen on the Main page). Shown in degrees, stored in tenths.
+  // Margins and time-out of the bridge's temperature control (the mode itself is chosen with the buttons above). Shown in degrees, stored in tenths.
   auto marginField = [&](const char *name, int tenths) {
     return String("<input type=number name=") + name + " step=0.1 min=0 max=5 value=" + tenthsText(tenths) + "> ";
   };
-  form += "<h3>Temperature control</h3><p class=dim>Active mode: <b>" + String(controlModeText(s.controlMode)) + "</b> (choose it on the Main page). "
+  form += "<h3>Temperature control</h3><p class=dim>Active mode: <b>" + String(controlModeText(s.controlMode)) + "</b> (choose it above). "
           "With bridge control the heater switches off when the temperature reaches the setpoint plus the first margin and on again when it has dropped to the setpoint minus the second margin.</p>"
           "<form action='/set'>Room sensor (MQTT): off at setpoint + " + marginField("xoff", s.thermo.externalOffAbove) + "&deg;C, on at setpoint &minus; " + marginField("xon", s.thermo.externalOnBelow) + "&deg;C<br>"
           "Internal sensor: off at setpoint + " + marginField("ioff", s.thermo.internalOffAbove) + "&deg;C, on at setpoint &minus; " + marginField("ion", s.thermo.internalOnBelow) + "&deg;C<br>"
