@@ -1307,7 +1307,7 @@ static void publishHomeAssistantDiscovery() {
                 "\",\"stat_t\":\"" + TOPIC_POWER_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ic\":\"mdi:fireplace\"" + avail);
   publishEntity("number", "level", String("\"name\":\"Flame intensity\",\"uniq_id\":\"dimplex_level\",\"cmd_t\":\"") + TOPIC_FLAME_LEVEL_SET +
                 "\",\"stat_t\":\"" + TOPIC_FLAME_LEVEL_STATE + "\",\"min\":1,\"max\":6,\"step\":1,\"mode\":\"slider\",\"ic\":\"mdi:fire\"" + avail);
-  publishEntity("switch", "heater_switch", String("\"name\":\"Heater\",\"uniq_id\":\"dimplex_heater_switch\",\"cmd_t\":\"") + TOPIC_HEATER_SET +
+  publishEntity("switch", "heater_switch", String("\"name\":\"Heating control\",\"uniq_id\":\"dimplex_heater_switch\",\"cmd_t\":\"") + TOPIC_HEATER_SET +
                 "\",\"stat_t\":\"" + TOPIC_HEATER_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ic\":\"mdi:radiator\"" + avail);
   publishEntity("number", "setpoint_number", String("\"name\":\"Setpoint\",\"uniq_id\":\"dimplex_setpoint_number\",\"cmd_t\":\"") + TOPIC_SETPOINT_SET +
                 "\",\"stat_t\":\"" + TOPIC_SETPOINT_STATE + "\",\"min\":15,\"max\":30,\"step\":1,\"mode\":\"box\",\"unit_of_meas\":\"°C\","

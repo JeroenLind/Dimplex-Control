@@ -131,7 +131,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | Entity | Type | Unique id |
 |---|---|---|
 | Fireplace | switch | `dimplex_power` |
-| Heater | switch | `dimplex_heater_switch` |
+| Heating control (was "Heater") | switch | `dimplex_heater_switch` |
 | Heater element | binary sensor (heat) | `dimplex_heater_element` |
 | Setpoint | number (15 to 30) | `dimplex_setpoint_number` |
 | Flame intensity | number (1 to 6) | `dimplex_level` |
