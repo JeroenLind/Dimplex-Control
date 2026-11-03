@@ -118,7 +118,8 @@ static const char *TOPIC_POWER_STATE        = "dimplex/power/state";
 static const char *TOPIC_FLAME_LEVEL_SET    = "dimplex/level/set";          // 1..6
 static const char *TOPIC_FLAME_LEVEL_STATE  = "dimplex/level/state";
 static const char *TOPIC_HEATER_SET         = "dimplex/heater/set";         // ON/OFF
-static const char *TOPIC_HEATER_STATE       = "dimplex/heater/state";       // 0x0014 byte0, bit 0x04 clear = heater on
+static const char *TOPIC_HEATER_STATE       = "dimplex/heater/state";       // the Heater switch: heater on (0x0014 byte0, bit 0x04 clear); with bridge control: the user's wish for heating
+static const char *TOPIC_HEATER_ELEMENT_STATE = "dimplex/heater_element/state"; // ON/OFF: the heating element of the fireplace is really on (0x0014), also with bridge control
 static const char *TOPIC_SETPOINT_SET       = "dimplex/setpoint/set";       // degrees C (15..30), only while the heater is on
 static const char *TOPIC_SETPOINT_STATE     = "dimplex/setpoint/state";     // 0x0018, non-zero only while the heater is on
 static const char *TOPIC_BLE_SET            = "dimplex/ble/set";            // ON = bridge connects to the fireplace, OFF = release the link (remote can connect)
@@ -1184,7 +1185,7 @@ static void bleTask(void *) {
 // =====================================================================================================
 // What was last published, so only changes are sent. -1 / empty = unknown (publish at the next chance).
 static int g_publishedBleEnabled = -1;       // 0/1
-static int g_publishedPower = -1, g_publishedFlameLevel = -1, g_publishedHeater = -1;
+static int g_publishedPower = -1, g_publishedFlameLevel = -1, g_publishedHeater = -1, g_publishedHeaterElement = -1;
 static int g_publishedHeaterPower = -1;        // 0 = low, 1 = high, 2 = unknown value
 static int g_publishedSetpoint = -1;           // degrees; SETPOINT_NONE = "unknown" was published (heater off)
 static int g_publishedTemperatureTenths = -1;  // tenths of a degree (243 = 24.3); SETPOINT_NONE = "unknown" was published
@@ -1252,7 +1253,7 @@ static void queueMqttCommand(CommandType type, int argument) {
 // Forget what was published, so the next publishChanges() sends everything again.
 static void forgetPublishedValues() {
   g_publishedBleEnabled = -1;
-  g_publishedPower = g_publishedFlameLevel = g_publishedHeater = g_publishedHeaterPower = g_publishedSetpoint = -1;
+  g_publishedPower = g_publishedFlameLevel = g_publishedHeater = g_publishedHeaterElement = g_publishedHeaterPower = g_publishedSetpoint = -1;
   g_publishedTemperatureTenths = -1; g_publishedRaw[0] = 0;
   g_publishedControlMode = g_publishedThermostat = -1;
   g_diagnosticsDue = true;
@@ -1316,6 +1317,8 @@ static void publishHomeAssistantDiscovery() {
   // ---- read-only ----
   publishEntity("sensor", "level", String("\"name\":\"Flame intensity state\",\"uniq_id\":\"dimplex_levelstate\",\"stat_t\":\"") + TOPIC_FLAME_LEVEL_STATE +
                 "\",\"ic\":\"mdi:fire\"" + avail);
+  publishEntity("binary_sensor", "heater_element", String("\"name\":\"Heater element\",\"uniq_id\":\"dimplex_heater_element\",\"stat_t\":\"") + TOPIC_HEATER_ELEMENT_STATE +
+                "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"dev_cla\":\"heat\",\"ic\":\"mdi:radiator\"" + avail);
   publishEntity("sensor", "heater_power", String("\"name\":\"Heater power\",\"uniq_id\":\"dimplex_heater_power\",\"stat_t\":\"") + TOPIC_HEATER_POWER_STATE +
                 "\",\"ic\":\"mdi:flash\"" + avail);
   publishEntity("sensor", "temperature", String("\"name\":\"Internal temperature\",\"uniq_id\":\"dimplex_temperature\",\"stat_t\":\"") + TOPIC_TEMPERATURE_STATE +
@@ -1427,6 +1430,8 @@ static void publishChanges(const SharedState &s) {
   }
   bool heaterOn = isHeaterSwitchOn(s);                      // with bridge control: the user's wish, not the momentary state of the element
   if (!hold && (int) heaterOn != g_publishedHeater) { g_mqttClient.publish(TOPIC_HEATER_STATE, heaterOn ? "ON" : "OFF", true); g_publishedHeater = heaterOn; logLine("pub", "heater=%d", heaterOn); }
+  bool elementOn = isHeaterOn(s);                           // the element itself: no echo hold, it is a read-only state
+  if ((int) elementOn != g_publishedHeaterElement) { g_mqttClient.publish(TOPIC_HEATER_ELEMENT_STATE, elementOn ? "ON" : "OFF", true); g_publishedHeaterElement = elementOn; logLine("pub", "heater element=%d", elementOn); }
   int powerCode = (s.regHeaterPower == 0x01) ? 0 : (s.regHeaterPower == 0x03 ? 1 : 2);
   if (powerCode != g_publishedHeaterPower) {
     char text[12]; if (powerCode == 2) snprintf(text, sizeof(text), "raw %02x", s.regHeaterPower); else snprintf(text, sizeof(text), "%s", powerCode ? "high" : "low");

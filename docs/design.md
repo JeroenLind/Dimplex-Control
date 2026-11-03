@@ -114,6 +114,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 |---|---|---|
 | `dimplex/power/state` | `ON` / `OFF` | Flame effect |
 | `dimplex/heater/state` | `ON` / `OFF` | In a bridge mode: the user's wish for heating, not the momentary state of the element (so it stays `ON` while the target is reached) |
+| `dimplex/heater_element/state` | `ON` / `OFF` | The heating element of the fireplace is really on (register `0x0014`), in every mode. In a bridge mode it follows the thermostat, so it switches on and off while `heater/state` stays `ON` |
 | `dimplex/setpoint/state` | degrees or `None` | Mode "Fireplace thermostat": `None` (unknown in Home Assistant) while the heater is off or before the first reading. Bridge modes: always the bridge setpoint |
 | `dimplex/level/state` | `1` to `6` | |
 | `dimplex/heater_power/state` | `low` / `high` / `raw xx` | |
@@ -131,6 +132,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 |---|---|---|
 | Fireplace | switch | `dimplex_power` |
 | Heater | switch | `dimplex_heater_switch` |
+| Heater element | binary sensor (heat) | `dimplex_heater_element` |
 | Setpoint | number (15 to 30) | `dimplex_setpoint_number` |
 | Flame intensity | number (1 to 6) | `dimplex_level` |
 | Bluetooth link | switch (config) | `dimplex_ble_link` |
@@ -474,7 +476,7 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Settings in NVS, set up through a captive portal | No credentials in the source needed for normal use, and no re-flash to change the broker or fireplace. |
 | Thermostat in the bridge, in `bleTask` | The fireplace's own thermostat is unreliable. The bridge already owns the BLE link, so the control needs no new task and no new locking. |
 | Decision logic in `thermostat.h` | It has no hardware calls, so the hysteresis and the fail-safe are tested on a PC. |
-| Heater switch = wish in bridge modes | The element is off for part of the time; if the switch followed the element, Home Assistant would flip the switch off every cycle. |
+| Heater switch = wish in bridge modes | The element is off for part of the time; if the switch followed the element, Home Assistant would flip the switch off every cycle. The real state of the element is published separately on `dimplex/heater_element/state`. |
 | Fail-safe turns the heater off, not the whole fireplace | The flame effect is harmless; only the heating depends on a sensor value. |
 | Control mode only on the web page | The issue asks for the web interface to choose it; Home Assistant shows it read-only. |
 | Everything in one sketch file | Simple for the Arduino IDE and for readers. The numbered sections keep it navigable. |
