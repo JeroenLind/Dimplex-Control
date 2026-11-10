@@ -8,6 +8,7 @@ Built and tested on a **Dimplex Engine 56/600** (Pro Range, ENG56-600, firmware 
 
 - **Fireplace control:** flame effect on/off, flame level F1–F6, heater on/off, setpoint, heater power low/high (0.9 / 1.8 kW).
 - **Temperature control in the bridge:** the fireplace's own thermostat does not regulate reliably, so the bridge can do it itself, with hysteresis. Three modes, chosen on the Settings page: *Fireplace thermostat* (the bridge only switches the heater on and off), *Room sensor (MQTT)* and *Internal sensor*. See "Temperature control" below.
+- **One-press heating:** *Heating On* on the web page switches the flame effect on first when it is off, and then starts the heater. The separate *Flame effect* and *Heating* buttons stay, so you can still do it step by step. Over MQTT (Home Assistant) the heater still only starts when the flame effect is already on.
 - **Web interface** at `http://dimplex-control.local/` with three pages:
   - **Main:** Bluetooth link, flame effect, heating, setpoint, thermostat status, room temperature and the internal temperature.
   - **Settings:** flame level, heater power, temperature control mode with margins and time-out, volume (models with sound), choosing the fireplace (scan or enter the address and passkey) and a factory reset.

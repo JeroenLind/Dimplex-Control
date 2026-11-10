@@ -102,7 +102,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | Topic | Payload | Effect |
 |---|---|---|
 | `dimplex/power/set` | `ON` / `OFF` | Flame effect on; `OFF` switches everything off, the heater included |
-| `dimplex/heater/set` | `ON` / `OFF` | Heater on (only works while the flame effect is on) or off |
+| `dimplex/heater/set` | `ON` / `OFF` | Heater on (only works while the flame effect is on; MQTT does not start the effect itself) or off |
 | `dimplex/setpoint/set` | degrees, e.g. `21` | Setpoint, rounded and clamped to the limits. Mode "Fireplace thermostat": the fireplace's setpoint, only while the heater is on. Bridge modes: the bridge's own setpoint, at any time |
 | `dimplex/level/set` | `1` to `6` | Flame level |
 | `dimplex/ble/set` | `ON` / `OFF` | `ON` = bridge holds the Bluetooth link; `OFF` = release it for the remote |
@@ -476,6 +476,7 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Settings in NVS, set up through a captive portal | No credentials in the source needed for normal use, and no re-flash to change the broker or fireplace. |
 | Thermostat in the bridge, in `bleTask` | The fireplace's own thermostat is unreliable. The bridge already owns the BLE link, so the control needs no new task and no new locking. |
 | Decision logic in `thermostat.h` | It has no hardware calls, so the hysteresis and the fail-safe are tested on a PC. |
+| Web Heating On starts the flame effect first | One press starts the heating. The web page sends `CMD_HEATER` with argument 2 (on, flame effect first); `bleSetHeater()` then switches the effect on, waits for the fireplace to confirm it and continues. The separate Flame effect and Heating buttons stay for doing it step by step. MQTT keeps the old rule so an automation never turns the flame on by surprise. |
 | Heater switch = wish in bridge modes | The element is off for part of the time; if the switch followed the element, Home Assistant would flip the switch off every cycle. The real state of the element is published separately on `dimplex/heater_element/state`. |
 | Fail-safe turns the heater off, not the whole fireplace | The flame effect is harmless; only the heating depends on a sensor value. |
 | Control mode only on the web page (Settings) | The issue asks for the web interface to choose it; it is a setting rather than a daily control, so it sits with the margins; Home Assistant shows it read-only. |
@@ -493,7 +494,7 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Remote holds the link | Connect attempts fail every 5 s until the remote disconnects. Releasing the bridge's link on purpose avoids this. |
 | Link drops | `onDisconnect` (NimBLE host task) only clears the state flags. All register access goes through `readRegister()` / `writeRegister()`, which refuse to work while the link is down, so a drop in the middle of a command cannot crash the BLE task. The BLE task reconnects, runs the handshake again and the MQTT task republishes everything. |
 | Command queue full | "Busy, try again" on the page, and the drop is counted on the Debug page. |
-| Command refused by the fireplace logic | A message on the page and in the log (for example the heater while the effect is off). Orange buttons clear after 2 s when nothing is pending. |
+| Command refused by the fireplace logic | A message on the page and in the log (for example the heater over MQTT while the effect is off). Orange buttons clear after 2 s when nothing is pending. |
 | Write not confirmed | `state NOT confirmed` in the log. The next poll shows the real state. |
 | Invalid fireplace address or passkey | Not saved; a message says why. |
 | NTP not yet available | The clock write is postponed and retried every 2 s. |

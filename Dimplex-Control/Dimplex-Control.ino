@@ -902,7 +902,19 @@ static void runThermostat() {
 
 // Heater button / switch. Without bridge control it switches the heater of the fireplace. With bridge control it sets or clears
 // the user's wish for heating and lets the thermostat do the switching.
-static bool bleSetHeater(bool on) {
+// startFlameFirst (web Heating button): when the flame effect is off, switch it on first and wait for the fireplace to confirm,
+// so one press starts the heating. MQTT does not do this: the heater then still needs the flame effect to be on.
+static bool bleSetHeater(bool on, bool startFlameFirst = false) {
+  if (on && startFlameFirst && requireBleReady()) {
+    readFireplaceState();
+    if (!flameEffectIsOn()) {
+      logLine("ble", "heating requested with the flame effect off: switching the flame effect on first");
+      bleSetFlameEffect(true);                              // waits (up to 4 s) until the fireplace reports the effect on
+      readFireplaceState();
+      if (!flameEffectIsOn()) { setMessage("Heater not started: the flame effect did not switch on"); return false; }
+      delay(300);                                           // let the fireplace settle before the heater sequence
+    }
+  }
   if (g_controlMode == CONTROL_FIREPLACE) return bleSwitchHeaterPhysical(on);
   if (!requireBleReady() || !g_chHeater) return false;
   readFireplaceState();
@@ -1107,7 +1119,7 @@ static void executeCommand(const Command &c) {
   char step[STEP_TEXT_LENGTH]; snprintf(step, sizeof(step), "command: %s (%d)", commandName(c.type), c.argument); setBleStep(step);
   switch (c.type) {
     case CMD_FLAME_EFFECT: bleSetFlameEffect(c.argument != 0); break;
-    case CMD_HEATER:       bleSetHeater(c.argument != 0); break;
+    case CMD_HEATER:       bleSetHeater(c.argument != 0, c.argument == 2); break;       // 2 = on, and the flame effect first if it is off (web)
     case CMD_HEATER_POWER: bleSetHeaterPower(c.argument != 0); break;
     case CMD_SETPOINT:     bleSetSetpoint(c.argument); break;
     case CMD_SETPOINT_DELTA:                                   // +/- buttons: relative to the value read now, so quick clicks add up
@@ -1665,7 +1677,7 @@ static String buildMainLive(const SharedState &s) {
   h += "<h3>Flame effect</h3>" + choiceButton("On", setHref("fx=on"), effectOn, AW_EFFECT, 1) + choiceButton("Off (all off)", setHref("fx=off"), ready && !effectOn, AW_EFFECT, 0);
 
   h += "<h3>Heating</h3>" + choiceButton("On", setHref("heater=on"), heaterOn, AW_HEATER, 1) + choiceButton("Off", setHref("heater=off"), ready && effectOn && !heaterOn, AW_HEATER, 0);
-  h += bridgeControl ? buildThermostatStatus(s) : String("<p class=dim>The heater can only be started while the flame effect is on.</p>");
+  h += bridgeControl ? buildThermostatStatus(s) : String("<p class=dim>Heating On switches the flame effect on first when it is off. Without the flame effect the fireplace cannot heat.</p>");
 
   h += "<h3>Setpoint</h3>";
   if (bridgeControl || heaterRunning) {            // the bridge's own setpoint can be set at any time; the fireplace's only while its heater runs
@@ -1944,7 +1956,12 @@ static void handleSet() {
   auto clampSetpoint = [&](int degrees) { return degrees < now.setpointMin ? now.setpointMin : (degrees > now.setpointMax ? now.setpointMax : degrees); };
   if (g_webServer.hasArg("ble"))    { bool on = g_webServer.arg("ble") != "off"; request(on ? CMD_BLE_RESUME : CMD_BLE_RELEASE, 0, AW_BLE, on); }
   if (g_webServer.hasArg("fx"))     { bool on = g_webServer.arg("fx") == "on"; request(CMD_FLAME_EFFECT, on, AW_EFFECT, on); }
-  if (g_webServer.hasArg("heater")) { bool on = g_webServer.arg("heater") == "on"; request(CMD_HEATER, on, AW_HEATER, on); }
+  if (g_webServer.hasArg("heater")) {
+    bool on = g_webServer.arg("heater") == "on";
+    bool effectWasOff = on && !isFlameEffectOn(now);       // one press starts the flame effect and then the heater
+    request(CMD_HEATER, on ? 2 : 0, AW_HEATER, on);
+    if (effectWasOff && queued) awaitControl(AW_EFFECT, 1);
+  }
   if (g_webServer.hasArg("hpwr"))   { bool high = g_webServer.arg("hpwr") == "high"; request(CMD_HEATER_POWER, high, AW_HEATER_POWER, high); }
   if (g_webServer.hasArg("sp"))     { int degrees = g_webServer.arg("sp").toInt(); request(CMD_SETPOINT, degrees, AW_SETPOINT, clampSetpoint(degrees)); }
   if (g_webServer.hasArg("spd"))    { int delta = g_webServer.arg("spd").toInt(); request(CMD_SETPOINT_DELTA, delta, AW_SETPOINT, clampSetpoint(currentSetpoint() + delta)); }
