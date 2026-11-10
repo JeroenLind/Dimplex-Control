@@ -1676,7 +1676,7 @@ static String buildMainLive(const SharedState &s) {
 
   h += "<h3>Flame effect</h3>" + choiceButton("On", setHref("fx=on"), effectOn, AW_EFFECT, 1) + choiceButton("Off (all off)", setHref("fx=off"), ready && !effectOn, AW_EFFECT, 0);
 
-  h += "<h3>Heating</h3>" + choiceButton("On", setHref("heater=on"), heaterOn, AW_HEATER, 1) + choiceButton("Off", setHref("heater=off"), ready && effectOn && !heaterOn, AW_HEATER, 0);
+  h += "<h3>Heating</h3>" + choiceButton("On", setHref("heater=on"), heaterOn, AW_HEATER, 1) + choiceButton("Off", setHref("heater=off"), ready && !heaterOn, AW_HEATER, 0);
   h += bridgeControl ? buildThermostatStatus(s) : String("<p class=dim>Heating On switches the flame effect on first when it is off. Without the flame effect the fireplace cannot heat.</p>");
 
   h += "<h3>Setpoint</h3>";
