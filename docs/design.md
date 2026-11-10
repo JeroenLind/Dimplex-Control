@@ -122,7 +122,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | `dimplex/control_mode/state` | text | Selected temperature control: `Fireplace thermostat`, `Room sensor (MQTT)`, `Internal sensor` (retained). Changed on the web page only |
 | `dimplex/thermostat/state` | text | `heating`, `target reached`, `no room temperature`, `off`, `not used` (retained) |
 | `dimplex/ble/state` | `ON` / `OFF` | Also published while the link is released |
-| `dimplex/raw/state` | text | Raw register values for diagnostics |
+| `dimplex/raw/state` | text | Registers that are not understood yet, for diagnostics: `3c=` (probably the water level, about 1000 to 1100 with water, 3 when the tank is empty) and `63=` (intensity of the effect). The registers that have their own entities are not repeated here; the Debug page still shows all of them |
 | `dimplex/diag/state` | JSON | Health values (restart reason, uptime, memory, signal, counters); published after connecting and then every 60 s |
 | `dimplex/status` | `online` / `offline` | Availability (last will) |
 

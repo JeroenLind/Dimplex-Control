@@ -13,7 +13,7 @@ Built and tested on a **Dimplex Engine 56/600** (Pro Range, ENG56-600, firmware 
   - **Main:** Bluetooth link, flame effect, heating, setpoint, thermostat status, room temperature and the internal temperature.
   - **Settings:** flame level, heater power, temperature control mode with margins and time-out, volume (models with sound), choosing the fireplace (scan or enter the address and passkey) and a factory reset.
   - **Debug:** CSV status log download, raw registers, temperature history, connection and system information.
-- **MQTT with Home Assistant auto-discovery:** switches for the fireplace, heater and Bluetooth link, numbers for flame level and setpoint, and sensors for heater power, internal temperature and raw registers.
+- **MQTT with Home Assistant auto-discovery:** switches for the fireplace, heater and Bluetooth link, numbers for flame level and setpoint, and sensors for heater power, internal temperature and raw registers (only the registers that are not understood yet).
 - **Responsive:** web, BLE and MQTT run in separate FreeRTOS tasks, so a slow broker or a fireplace that is out of range does not freeze the page.
 - **Installable as an app:** add the web interface to the home screen of an iPhone or Android phone so it opens full screen with its own icon (see below).
 - **Diagnostics:** the Debug page and Home Assistant show why the bridge last restarted, how many starts there have been and health values such as uptime, memory and Wi-Fi signal. The last log lines before a crash survive the restart.
