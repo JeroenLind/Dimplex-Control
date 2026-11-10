@@ -186,12 +186,31 @@ Use Lammerink's method: dump A, disconnect the ESP32, change **one** setting on 
 5. **Clock-related registers** (volume is not relevant: the fireplace has no sound).
 6. **°C -> °F and lowering the maximum setpoint**, for 0x001c and 0x001e.
 7. **DST on/off** and moving the clock by an hour, for the flag in 0x0010 (DST ends on 25 October 2026 in Europe).
-8. **Water and run-on time:** dumps every minute after switching off for 0x0040 byte 2, and effect on with an empty tank.
+8. **Water and run-on time:** dumps every minute after switching off for 0x0040 byte 2. ~~Effect on with an empty tank~~ **done** (section 9): 0x003c drops to 3. Still to do: slowly lowering the water level to find the value at which the fireplace beeps.
 9. **Other unknown registers:** 0x0051 (flips on its own), 0x0053, 0x0026, 0x003c. First only observe, then interpret.
 10. ~~Temperature source 0x0055~~ **settled:** internal fireplace sensor (section 5).
 11. **Thermostat:** set the setpoint below the room temperature (e.g. 16 with a room at 18) with a power meter and see whether the heating element switches off, and set it a few degrees above to check it keeps heating. Section 8 shows the element does not follow 0x0055 reaching the setpoint.
 12. **History:** the bridge keeps about 120 rows (one row per change or per minute). For longer logs: lower the logging frequency or enlarge the buffer.
 13. Only when everything above is done: a write test of one register at a time, with your hand on the power switch, because it is a heater.
+
+## 9. Empty water tank, 10 Nov (Home Assistant history of the raw registers)
+
+Setup: effect on, heater on (low power, setpoint 18), flame level F1. At about 16:30 local time (15:30 UTC; the Home Assistant export is in UTC, which explains the one-hour difference in the logging) the tank was emptied on purpose and filled again a minute later. The bridge published the registers every 5 s; a power meter measured the fireplace. Two exports: 14:56 to 15:00 UTC (effect on, heater off) and 15:00 to 15:32 UTC (heater on).
+
+| UTC | 0x003c | 0x0063 | 0x0040 / 0x0014 | Power |
+|---|---|---|---|---|
+| until 15:30:00 | 1050-1090 | `003a` | `0101` / `0200` | about 995 W |
+| 15:30:03 to 15:30:29 | **3** (`010300`) | `003a`, then `0000` from 15:30:19 | unchanged | 845 W at 15:30:16 |
+| 15:30:33 and :39 | 1053, 1042 | `0000` | unchanged | |
+| 15:30:43 | 3 | `0100` (once) | unchanged | 991 W |
+| 15:30:50 | 3 | `003a` | unchanged | |
+| from 15:30:54 | 1056-1098 | `003a` | unchanged | about 1000 W |
+
+- **0x003c is the water level.** It is about 1000 to 1100 with water and **3** without; 7 samples of 3 in 47 s, exactly during the empty tank, while the water was being put back. Earlier `ffff` values (section 4) are not 3, so they are still an invalid reading.
+- **The effect switches off by itself** (0x0063 `0000`, power down about 150 W, which is the effect's share: with the heater off and the effect on the meter shows about 164 W). The heater keeps running, as observed.
+- **0x0040 and 0x0014 do not change.** Byte 2 of 0x0040 is therefore not a low water indicator, and the "flame effect on" bit stays set while the lamps are off. A bridge that wants to detect low water has to read 0x003c (and 0x0063).
+- **Normal range.** Over 469 readings with water: 1002 to 1098, mean 1029 with the heater off and 1059 with the heater on. In the heater-on window the value correlates a little with the internal temperature (r = 0.41); with the heater off there is no correlation (r = 0.03). The change is small against the gap to 3, so a threshold anywhere between 100 and 900 separates the cases. The value at which the fireplace itself beeps is not known (only empty and full were tried).
+- **Not yet known:** the transition values (a tank that is nearly empty), whether the fireplace beeps with `0x003c` = 3 and what happens to 0x003c when the effect is off for a long time (standby gives `010000`).
 
 ## 8. Home Assistant history of 19 Oct (bridge via MQTT, power meter, room sensor)
 

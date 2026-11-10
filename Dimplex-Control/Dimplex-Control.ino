@@ -1462,11 +1462,9 @@ static void publishChanges(const SharedState &s) {
     char temperature[10]; snprintf(temperature, sizeof(temperature), "%d.%d", temperatureTenths / 10, temperatureTenths % 10);
     g_mqttClient.publish(TOPIC_TEMPERATURE_STATE, temperature, true); g_publishedTemperatureTenths = temperatureTenths;
   }
-  char hexControl[6], hexHeater[6], hexSetpoint[6], hexPower[4], hexTemperature[8], hex3c[8], hex63[6], raw[120];
-  uint8_t setpointBytes[2] = {(uint8_t)(s.setpoint & 0xff), (uint8_t)(s.setpoint >> 8)};
-  bytesToHex(hexControl, s.regControl, 2); bytesToHex(hexHeater, s.regHeater, 2); bytesToHex(hexSetpoint, setpointBytes, 2);
-  bytesToHex(hexPower, &s.regHeaterPower, 1); bytesToHex(hexTemperature, s.regTemperature, 3); bytesToHex(hex3c, s.regUnknown3c, 3); bytesToHex(hex63, s.regUnknown63, 2);
-  snprintf(raw, sizeof(raw), "40=%s 14=%s 18=%s 48=%s 55=%s 3c=%s 63=%s", hexControl, hexHeater, hexSetpoint, hexPower, hexTemperature, hex3c, hex63);
+  char hex3c[8], hex63[6], raw[40];                         // only registers that are not understood yet (the others have their own entities)
+  bytesToHex(hex3c, s.regUnknown3c, 3); bytesToHex(hex63, s.regUnknown63, 2);
+  snprintf(raw, sizeof(raw), "3c=%s 63=%s", hex3c, hex63);
   if (strcmp(raw, g_publishedRaw) != 0) { g_mqttClient.publish(TOPIC_RAW_STATE, raw, true); strlcpy(g_publishedRaw, raw, sizeof(g_publishedRaw)); }
 }
 
