@@ -34,7 +34,7 @@ Confidence levels:
 | 0x005d | 0x4000 | 2 B | R | `0100` standby / `0164` effect on | Byte 2 = 0x64 (100) while the effect is on: "on + intensity" | Plausible |
 | 0x005f, 0x0065 | 0x4001, 0x4005 | 2 B | R | `0100` standby / `0101` effect on | Byte 2 follows "effect on" | Plausible |
 | 0x0053 | 0x0007 | 1 B | R | `00` or `03` | Becomes `03` after the fireplace has been switched off for the first time after power-up, and then stays `03` (also with effect and heater on). Not an effect flag; probably a session or start-up state | Unknown |
-| 0x0051 | 0x0004 | 2 B | R | `0100` / `0101` | Changes on its own (counter or measurement). Not a setting | Unknown |
+| 0x0051 | 0x0004 | 2 B | R | `0100` / `0101` | Changes on its own (counter or measurement). Not a setting. **Watched** since 11 Nov (raw MQTT sensor `51=`, Debug page, CSV `reg0051`): compare with a power meter to see whether it follows the heating element | Unknown |
 
 **Byte 2 of 0x0040.** It is `01` while the flame effect is on and still `01` about a minute after switching off, but `00` after about half an hour. This fits an "effect active or just switched off" flag (run-on time). It does **not** indicate a low water level: with an empty tank byte 2 stayed `01` (10 Nov, experiments.md section 9).
 
@@ -137,11 +137,11 @@ All of these were constant in every observation unless noted, and their meaning 
 |---|---|---|---|
 | 0x0020 | 0x1007 | 9x `00` | |
 | 0x0022 | 0x1008 | `00` | |
-| 0x0024 | 0x100d | `00` | |
-| 0x0026 | 0x1011 | `00` | Was `35` (53) once, so not strictly constant: counter or measurement? |
+| 0x0024 | 0x100d | `00` | Polled by the remote. **Watched** since 11 Nov (`24=`, CSV `reg0024`): a change could be a fault flag |
+| 0x0026 | 0x1011 | `00` | Was `35` (53) once, so not strictly constant: counter or measurement? **Watched** since 11 Nov (`26=`, CSV `reg0026`) |
 | 0x0030 | 0x1016 | `0010` | |
 | 0x0032 | 0x1017 | `0003` | |
-| 0x0036 | 0x1027 | `0000` | |
+| 0x0036 | 0x1027 | `0000` | Polled by the remote. **Watched** since 11 Nov (`36=`, CSV `reg0036`): a change could be a fault flag |
 | 0x003a | 0x102a | `0013010100000700` | looks like the date 2019-01-01 (factory date?) |
 | 0x003e | 0x4006 | `010000` | |
 | 0x0044 | 0x400a | `0a02` | |

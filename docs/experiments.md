@@ -187,7 +187,7 @@ Use Lammerink's method: dump A, disconnect the ESP32, change **one** setting on 
 6. **°C -> °F and lowering the maximum setpoint**, for 0x001c and 0x001e.
 7. **DST on/off** and moving the clock by an hour, for the flag in 0x0010 (DST ends on 25 October 2026 in Europe).
 8. **Water and run-on time:** dumps every minute after switching off for 0x0040 byte 2. ~~Effect on with an empty tank~~ **done** (section 9): 0x003c drops to 3. Still to do: slowly lowering the water level to find the value at which the fireplace beeps.
-9. **Other unknown registers:** 0x0051 (flips on its own), 0x0053, 0x0026, 0x003c. First only observe, then interpret.
+9. **Other unknown registers:** 0x0051 (flips on its own), 0x0053, 0x0026. First only observe, then interpret. Since 11 Nov the bridge watches 0x0051, 0x0026, 0x0036 and 0x0024 (raw MQTT sensor, Debug page, CSV); to do: run with a power meter and compare 0x0051 with the heating element switching, and note any change of the other three. 0x003c is explained in section 9.
 10. ~~Temperature source 0x0055~~ **settled:** internal fireplace sensor (section 5).
 11. **Thermostat:** set the setpoint below the room temperature (e.g. 16 with a room at 18) with a power meter and see whether the heating element switches off, and set it a few degrees above to check it keeps heating. Section 8 shows the element does not follow 0x0055 reaching the setpoint.
 12. **History:** the bridge keeps about 120 rows (one row per change or per minute). For longer logs: lower the logging frequency or enlarge the buffer.

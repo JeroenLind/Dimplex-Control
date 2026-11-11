@@ -163,6 +163,7 @@ struct StatusSample {                       // one row of the temperature table 
   uint8_t control0, control1, heater0, heaterPower, flameLevel;   // 0x0040 (2 bytes), 0x0014 byte 0, 0x0048, 0x0042
   uint16_t setpoint, unknown3c;             // 0x0018, 0x003c
   uint8_t unknown63[2];                     // 0x0063
+  uint8_t extra51[2], extra26, extra36[2], extra24;   // 0x0051, 0x0026, 0x0036, 0x0024: registers we only watch
 };
 struct ScanEntry { char name[28]; char address[20]; int rssi; };   // one fireplace found by a BLE scan
 #define SCAN_MAX 8
@@ -170,6 +171,7 @@ struct ScanEntry { char name[28]; char address[20]; int rssi; };   // one firepl
 struct SharedState {
   bool valid, connected, ready, bleEnabled, haveTarget;
   uint8_t regControl[2], regHeater[2], regHeaterPower, flameLevel, volume, regTemperature[3], regUnknown3c[3], regUnknown63[2];
+  uint8_t regExtra51[2], regExtra26, regExtra36[2], regExtra24;   // registers we only watch (not understood yet)
   bool lowWater;                             // the mist maker is dry (waterwatch.h)
   int setpoint, setpointMin, setpointMax;
   // temperature control in the bridge (thermostat.h)
@@ -388,7 +390,7 @@ static void stageThermostatSettings(const int values[5]) {
 static NimBLEClient *g_bleClient = nullptr;
 static NimBLERemoteCharacteristic *g_chControl = nullptr, *g_chFlameLevel = nullptr, *g_chClock = nullptr, *g_chInit = nullptr;
 static NimBLERemoteCharacteristic *g_chHeater = nullptr, *g_chSetpoint = nullptr, *g_chHeaterPower = nullptr, *g_chTemperature = nullptr;
-static NimBLERemoteCharacteristic *g_chUnknown3c = nullptr, *g_chUnknown63 = nullptr, *g_chSetpointLimits = nullptr, *g_chVolume = nullptr;
+static NimBLERemoteCharacteristic *g_chUnknown3c = nullptr, *g_chUnknown63 = nullptr, *g_chExtra51 = nullptr, *g_chExtra26 = nullptr, *g_chExtra36 = nullptr, *g_chExtra24 = nullptr, *g_chSetpointLimits = nullptr, *g_chVolume = nullptr;
 static volatile bool g_bleConnected = false, g_blePaired = false;
 static volatile bool g_bleReady = false, g_initSent = false;
 static volatile bool g_bleEnabled = true;       // false = link released so the original remote can connect
@@ -404,6 +406,7 @@ static bool g_ntpStarted = false;               // loop() only
 // ---- live state of the fireplace (filled by readFireplaceState(), copied to g_shared by publishSnapshot()) ----
 static uint8_t g_regControl[2] = {0, 0}, g_regHeater[2] = {0, 0}, g_regHeaterPower = 0;
 static uint8_t g_regTemperature[3] = {0, 0, 0}, g_regUnknown3c[3] = {0, 0, 0}, g_regUnknown63[2] = {0, 0};
+static uint8_t g_regExtra51[2] = {0, 0}, g_regExtra26 = 0, g_regExtra36[2] = {0, 0}, g_regExtra24 = 0;   // watched only: 0x0051, 0x0026, 0x0036, 0x0024
 static uint8_t g_flameLevel = 0, g_volume = 0;
 static WaterWatch g_waterWatch = {};            // low water detection on 0x003c (bleTask only)
 static int g_setpoint = 0;                      // 0x0018 (0 while the heater is off)
@@ -449,7 +452,8 @@ static void publishSnapshot() {
   s.valid = g_registersRead; s.connected = g_bleConnected; s.ready = g_bleReady; s.bleEnabled = g_bleEnabled;
   s.haveTarget = g_haveTarget; strlcpy(s.targetAddress, target, sizeof(s.targetAddress));
   memcpy(s.regControl, g_regControl, 2); memcpy(s.regHeater, g_regHeater, 2); memcpy(s.regTemperature, g_regTemperature, 3);
-  memcpy(s.regUnknown3c, g_regUnknown3c, 3); memcpy(s.regUnknown63, g_regUnknown63, 2); s.lowWater = g_waterWatch.lowWater;
+  memcpy(s.regUnknown3c, g_regUnknown3c, 3); memcpy(s.regUnknown63, g_regUnknown63, 2);
+  memcpy(s.regExtra51, g_regExtra51, 2); s.regExtra26 = g_regExtra26; memcpy(s.regExtra36, g_regExtra36, 2); s.regExtra24 = g_regExtra24; s.lowWater = g_waterWatch.lowWater;
   s.regHeaterPower = g_regHeaterPower; s.flameLevel = g_flameLevel; s.volume = g_volume; s.setpoint = g_setpoint;
   strlcpy(s.configuredAddress, cfg_fireplaceAddress, sizeof(s.configuredAddress)); strlcpy(s.passkeyText, cfg_passkeyText, sizeof(s.passkeyText));
   memcpy(s.scan, g_scanEntries, sizeof(g_scanEntries)); s.scanCount = g_scanCount; s.scanning = g_scanning; s.scanFinishedMs = g_scanFinishedMs;
@@ -563,7 +567,7 @@ class FireplaceClientCallbacks : public NimBLEClientCallbacks {
 // Returns true when at least the control register 0x0040 exists.
 static bool findFireplaceCharacteristics() {
   g_chControl = g_chFlameLevel = g_chClock = g_chInit = nullptr;
-  g_chHeater = g_chSetpoint = g_chHeaterPower = g_chTemperature = g_chUnknown3c = g_chUnknown63 = g_chSetpointLimits = g_chVolume = nullptr;
+  g_chHeater = g_chSetpoint = g_chHeaterPower = g_chTemperature = g_chUnknown3c = g_chUnknown63 = g_chExtra51 = g_chExtra26 = g_chExtra36 = g_chExtra24 = g_chSetpointLimits = g_chVolume = nullptr;
   for (auto *service : g_bleClient->getServices(true))
     for (auto *c : service->getCharacteristics(true)) {
       switch (c->getHandle()) {
@@ -577,6 +581,10 @@ static bool findFireplaceCharacteristics() {
         case 0x0055: g_chTemperature = c; break;
         case 0x003c: g_chUnknown3c = c; break;
         case 0x0063: g_chUnknown63 = c; break;
+        case 0x0051: g_chExtra51 = c; break;          // watched only (flips on its own)
+        case 0x0026: g_chExtra26 = c; break;          // watched only (counter or measurement?)
+        case 0x0036: g_chExtra36 = c; break;          // watched only (polled by the remote, always 0 so far)
+        case 0x0024: g_chExtra24 = c; break;          // watched only (polled by the remote, always 0 so far)
         case 0x001e: g_chSetpointLimits = c; break;
         case 0x0076: g_chVolume = c; break;           // volume (models with a sound effect only)
         default: break;
@@ -731,11 +739,13 @@ static void logStatusSample() {
   strlcpy(n.temperatureText, text, sizeof(n.temperatureText)); bytesToHex(n.temperatureRaw, g_regTemperature, 3);
   n.control0 = g_regControl[0]; n.control1 = g_regControl[1]; n.heater0 = g_regHeater[0]; n.heaterPower = g_regHeaterPower;
   n.flameLevel = g_flameLevel; n.setpoint = (uint16_t) g_setpoint; n.unknown3c = (uint16_t)(g_regUnknown3c[1] | (g_regUnknown3c[2] << 8)); memcpy(n.unknown63, g_regUnknown63, 2);
+  memcpy(n.extra51, g_regExtra51, 2); n.extra26 = g_regExtra26; memcpy(n.extra36, g_regExtra36, 2); n.extra24 = g_regExtra24;
   const StatusSample &last = g_history[(g_historyHead + HISTORY_SIZE - 1) % HISTORY_SIZE];
   bool changed = (g_historyCount == 0) || strcmp(last.temperatureText, n.temperatureText) != 0 || last.control0 != n.control0 ||
                  last.control1 != n.control1 || last.heater0 != n.heater0 || last.heaterPower != n.heaterPower ||
                  last.flameLevel != n.flameLevel || last.setpoint != n.setpoint ||
-                 memcmp(last.unknown63, n.unknown63, 2) != 0 || (last.unknown3c < WATER_DRY_BELOW) != (n.unknown3c < WATER_DRY_BELOW);   // 0x0063 and wet/dry (0x003c) are logged when they change
+                 memcmp(last.unknown63, n.unknown63, 2) != 0 || (last.unknown3c < WATER_DRY_BELOW) != (n.unknown3c < WATER_DRY_BELOW) ||
+                 memcmp(last.extra51, n.extra51, 2) != 0 || last.extra26 != n.extra26 || memcmp(last.extra36, n.extra36, 2) != 0 || last.extra24 != n.extra24;   // 0x0063, wet/dry (0x003c) and the watched registers are logged when they change
   if (changed || millis() - g_lastHistoryLogMs > 60000) {
     g_history[g_historyHead] = n;
     g_historyHead = (g_historyHead + 1) % HISTORY_SIZE; if (g_historyCount < HISTORY_SIZE) g_historyCount++;
@@ -756,6 +766,11 @@ static void readFireplaceState() {
   if (nPower >= 1) g_regHeaterPower = power[0];
   if (readRegister(g_chUnknown3c, g_regUnknown3c, 3) >= 3) waterWatchUpdate(g_waterWatch, g_regControl[0] != 0, g_regUnknown3c, millis());
   readRegister(g_chUnknown63, g_regUnknown63, 2);
+  { uint8_t v[2]; size_t n;                                   // registers we only watch; a failed read keeps the old value
+    if ((n = readRegister(g_chExtra51, v, 2)) >= 2) memcpy(g_regExtra51, v, 2);
+    if (readRegister(g_chExtra26, v, 1) >= 1) g_regExtra26 = v[0];
+    if ((n = readRegister(g_chExtra36, v, 2)) >= 2) memcpy(g_regExtra36, v, 2);
+    if (readRegister(g_chExtra24, v, 1) >= 1) g_regExtra24 = v[0]; }
   { uint8_t level[1]; if (readRegister(g_chFlameLevel, level, 1) >= 1) g_flameLevel = level[0]; }
   { uint8_t volume[1]; if (readRegister(g_chVolume, volume, 1) >= 1) g_volume = volume[0]; }
   if (!g_limitsRead && g_chSetpointLimits) {         // 0x001e = min, max setpoint (LE16 each), e.g. 0f00 1e00 = 15..30
@@ -1472,9 +1487,10 @@ static void publishChanges(const SharedState &s) {
     char temperature[10]; snprintf(temperature, sizeof(temperature), "%d.%d", temperatureTenths / 10, temperatureTenths % 10);
     g_mqttClient.publish(TOPIC_TEMPERATURE_STATE, temperature, true); g_publishedTemperatureTenths = temperatureTenths;
   }
-  char hex3c[8], hex63[6], raw[40];                         // only registers that are not understood yet (the others have their own entities)
+  char hex3c[8], hex63[6], raw[80];                         // only registers that are not understood yet (the others have their own entities)
   bytesToHex(hex3c, s.regUnknown3c, 3); bytesToHex(hex63, s.regUnknown63, 2);
-  snprintf(raw, sizeof(raw), "3c=%s 63=%s", hex3c, hex63);
+  char hex51[6], hex36[6]; bytesToHex(hex51, s.regExtra51, 2); bytesToHex(hex36, s.regExtra36, 2);
+  snprintf(raw, sizeof(raw), "3c=%s 63=%s 51=%s 26=%02x 36=%s 24=%02x", hex3c, hex63, hex51, s.regExtra26, hex36, s.regExtra24);
   if (strcmp(raw, g_publishedRaw) != 0) { g_mqttClient.publish(TOPIC_RAW_STATE, raw, true); strlcpy(g_publishedRaw, raw, sizeof(g_publishedRaw)); }
 }
 
@@ -1763,7 +1779,12 @@ static String buildDebugLive(const SharedState &s, uint32_t pending) {
     bytesToHex(unknown3c, s.regUnknown3c, 3); bytesToHex(unknown63, s.regUnknown63, 2);
     h += "<table><tr><th>handle</th><th>value</th><th>meaning</th></tr>";
     h += String("<tr><td>0x003c</td><td>") + unknown3c + "</td><td>mist maker load: ~1000-1100 in water, 3 dry (low water now: " + (s.lowWater ? "yes" : "no") + ")</td></tr>";
-    h += String("<tr><td>0x0063</td><td>") + unknown63 + "</td><td>effect intensity (0 when the fireplace switches the effect off by itself)</td></tr></table>";
+    h += String("<tr><td>0x0063</td><td>") + unknown63 + "</td><td>effect intensity (0 when the fireplace switches the effect off by itself)</td></tr>";
+    char e51[6], e36[6], e26[4], e24[4]; bytesToHex(e51, s.regExtra51, 2); bytesToHex(e36, s.regExtra36, 2); bytesToHex(e26, &s.regExtra26, 1); bytesToHex(e24, &s.regExtra24, 1);
+    h += String("<tr><td>0x0051</td><td>") + e51 + "</td><td>flips on its own (heating element?)</td></tr>";
+    h += String("<tr><td>0x0026</td><td>") + e26 + "</td><td>counter or measurement?</td></tr>";
+    h += String("<tr><td>0x0036</td><td>") + e36 + "</td><td>polled by the remote, 0 so far (fault flags?)</td></tr>";
+    h += String("<tr><td>0x0024</td><td>") + e24 + "</td><td>polled by the remote, 0 so far (fault flags?)</td></tr></table>";
     h += "<p class=dim>Read " + String((millis() - s.lastReadMs) / 1000) + " s ago &middot; limits " + String(s.setpointMin) + "&ndash;" + String(s.setpointMax) + " &deg;C</p>";
   } else h += "<p class=dim>No data (not connected).</p>";
 
@@ -1925,7 +1946,7 @@ static void handleCsv() {
   setWebStep("csv");
   copySnapshot(g_webSnapshot);
   const SharedState &s = g_webSnapshot;
-  String out = "uptime_s;time;temp_c;temp_raw;effect;heater;heater_power;setpoint_c;flame_level;reg003c;reg0063\n";
+  String out = "uptime_s;time;temp_c;temp_raw;effect;heater;heater_power;setpoint_c;flame_level;reg003c;reg0063;reg0051;reg0026;reg0036;reg0024\n";
   for (int i = s.historyCount - 1; i >= 0; i--) {
     const StatusSample &x = s.history[(s.historyHead - 1 - i + 2 * HISTORY_SIZE) % HISTORY_SIZE];
     char clockText[24] = "";
@@ -1933,8 +1954,9 @@ static void handleCsv() {
     bool heating = x.control0 != 0 && (x.heater0 & 0x04) == 0;
     char power[10]; if (x.heaterPower == 0x01) strcpy(power, "low"); else if (x.heaterPower == 0x03) strcpy(power, "high"); else snprintf(power, sizeof(power), "raw%02x", x.heaterPower);
     char reg63[6]; snprintf(reg63, sizeof(reg63), "%02x%02x", x.unknown63[0], x.unknown63[1]);
+    char extra[24]; snprintf(extra, sizeof(extra), "%02x%02x;%02x;%02x%02x;%02x", x.extra51[0], x.extra51[1], x.extra26, x.extra36[0], x.extra36[1], x.extra24);
     out += String(x.uptimeSec) + ";" + clockText + ";" + x.temperatureText + ";" + x.temperatureRaw + ";" + (x.control0 ? "on" : "off") + ";" +
-           (heating ? "on" : "off") + ";" + power + ";" + String(x.setpoint) + ";" + String(x.flameLevel) + ";" + String(x.unknown3c) + ";" + reg63 + "\n";
+           (heating ? "on" : "off") + ";" + power + ";" + String(x.setpoint) + ";" + String(x.flameLevel) + ";" + String(x.unknown3c) + ";" + reg63 + ";" + extra + "\n";
   }
   if (g_webServer.hasArg("download")) g_webServer.sendHeader("Content-Disposition", "attachment; filename=dimplex-status-log.csv");
   g_webServer.send(200, g_webServer.hasArg("download") ? "text/csv" : "text/plain", out);

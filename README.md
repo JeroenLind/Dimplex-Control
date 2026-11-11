@@ -13,7 +13,7 @@ Built and tested on a **Dimplex Engine 56/600** (Pro Range, ENG56-600, firmware 
 - **Web interface** at `http://dimplex-control.local/` with three pages:
   - **Main:** Bluetooth link, flame effect, heating, setpoint, thermostat status, room temperature and the internal temperature.
   - **Settings:** flame level, heater power, temperature control mode with margins and time-out, volume (models with sound), choosing the fireplace (scan or enter the address and passkey) and a factory reset.
-  - **Debug:** CSV status log download, the registers that are not understood yet (`0x003c` and `0x0063`), temperature history, connection and system information. The raw MQTT sensor and the CSV log show the same two registers; registers that are understood are not repeated there.
+  - **Debug:** CSV status log download, the registers that are not understood yet (`0x003c`, `0x0063`, and the watched `0x0051`, `0x0026`, `0x0036`, `0x0024`), temperature history, connection and system information. The raw MQTT sensor and the CSV log show the same registers; registers that are understood are not repeated there.
 - **MQTT with Home Assistant auto-discovery:** switches for the fireplace, heater and Bluetooth link, numbers for flame level and setpoint, and sensors for heater power, internal temperature and raw registers (only the registers that are not understood yet).
 - **Responsive:** web, BLE and MQTT run in separate FreeRTOS tasks, so a slow broker or a fireplace that is out of range does not freeze the page.
 - **Installable as an app:** add the web interface to the home screen of an iPhone or Android phone so it opens full screen with its own icon (see below).
