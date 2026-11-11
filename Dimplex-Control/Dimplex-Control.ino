@@ -57,6 +57,7 @@
 #include <esp_timer.h>       // esp_timer_get_time()
 #include "icons.h"           // app icons for "install on the phone" (second tab in the Arduino IDE)
 #include "thermostat.h"      // temperature control types and decision logic (third tab; plain C++, tested on a PC)
+#include "waterwatch.h"      // low water detection on register 0x003c (plain C++, tested on a PC)
 
 // =====================================================================================================
 // 1. SETTINGS
@@ -126,6 +127,7 @@ static const char *TOPIC_BLE_SET            = "dimplex/ble/set";            // O
 static const char *TOPIC_BLE_STATE          = "dimplex/ble/state";          // ON/OFF: whether the bridge is allowed to hold the BLE link
 static const char *TOPIC_HEATER_POWER_STATE = "dimplex/heater_power/state"; // low/high (0x0048: 01 = 0.9 kW, 03 = 1.8 kW)
 static const char *TOPIC_TEMPERATURE_STATE  = "dimplex/temperature/state";  // 0x0055: byte1 = degrees, byte2 = tenths
+static const char *TOPIC_LOW_WATER_STATE    = "dimplex/low_water/state";    // ON = the mist maker is dry (empty tank), derived from 0x003c (waterwatch.h)
 static const char *TOPIC_RAW_STATE          = "dimplex/raw/state";          // diagnostics: raw bytes of the interesting registers
 static const char *TOPIC_DIAG_STATE         = "dimplex/diag/state";         // JSON with restart reason, uptime, memory, signal ... (every 60 s)
 static const char *TOPIC_ROOM_TEMPERATURE_SET = "dimplex/room_temperature/set";   // room temperature in degrees C, e.g. 21.3 (plain number, publish WITHOUT retain)
@@ -167,6 +169,7 @@ struct ScanEntry { char name[28]; char address[20]; int rssi; };   // one firepl
 struct SharedState {
   bool valid, connected, ready, bleEnabled, haveTarget;
   uint8_t regControl[2], regHeater[2], regHeaterPower, flameLevel, volume, regTemperature[3], regUnknown3c[3], regUnknown63[2];
+  bool lowWater;                             // the mist maker is dry (waterwatch.h)
   int setpoint, setpointMin, setpointMax;
   // temperature control in the bridge (thermostat.h)
   uint8_t controlMode, thermostatState;      // ControlMode, ThermostatState
@@ -401,6 +404,7 @@ static bool g_ntpStarted = false;               // loop() only
 static uint8_t g_regControl[2] = {0, 0}, g_regHeater[2] = {0, 0}, g_regHeaterPower = 0;
 static uint8_t g_regTemperature[3] = {0, 0, 0}, g_regUnknown3c[3] = {0, 0, 0}, g_regUnknown63[2] = {0, 0};
 static uint8_t g_flameLevel = 0, g_volume = 0;
+static WaterWatch g_waterWatch = {};            // low water detection on 0x003c (bleTask only)
 static int g_setpoint = 0;                      // 0x0018 (0 while the heater is off)
 static int g_setpointMin = 15, g_setpointMax = 30;   // replaced by the limits read from 0x001e
 static String g_message = "";                   // result of the last action; shown on the web page for a few seconds
@@ -444,7 +448,7 @@ static void publishSnapshot() {
   s.valid = g_registersRead; s.connected = g_bleConnected; s.ready = g_bleReady; s.bleEnabled = g_bleEnabled;
   s.haveTarget = g_haveTarget; strlcpy(s.targetAddress, target, sizeof(s.targetAddress));
   memcpy(s.regControl, g_regControl, 2); memcpy(s.regHeater, g_regHeater, 2); memcpy(s.regTemperature, g_regTemperature, 3);
-  memcpy(s.regUnknown3c, g_regUnknown3c, 3); memcpy(s.regUnknown63, g_regUnknown63, 2);
+  memcpy(s.regUnknown3c, g_regUnknown3c, 3); memcpy(s.regUnknown63, g_regUnknown63, 2); s.lowWater = g_waterWatch.lowWater;
   s.regHeaterPower = g_regHeaterPower; s.flameLevel = g_flameLevel; s.volume = g_volume; s.setpoint = g_setpoint;
   strlcpy(s.configuredAddress, cfg_fireplaceAddress, sizeof(s.configuredAddress)); strlcpy(s.passkeyText, cfg_passkeyText, sizeof(s.passkeyText));
   memcpy(s.scan, g_scanEntries, sizeof(g_scanEntries)); s.scanCount = g_scanCount; s.scanning = g_scanning; s.scanFinishedMs = g_scanFinishedMs;
@@ -545,7 +549,7 @@ class FireplaceClientCallbacks : public NimBLEClientCallbacks {
     // pointer that turns null under its hands crashes it (LoadProhibited). bleTask replaces them at the next connection,
     // and every access goes through readRegister()/writeRegister(), which refuse to work while the link is down.
     g_bleConnected = g_blePaired = g_bleReady = g_initSent = false;
-    g_clockSet = false; g_registersRead = false; g_limitsRead = false;
+    g_clockSet = false; g_registersRead = false; g_limitsRead = false; waterWatchReset(g_waterWatch);
   }
   void onPassKeyEntry(NimBLEConnInfo &info) override { NimBLEDevice::injectPassKey(info, g_passkeyNumber); }
   void onConfirmPasskey(NimBLEConnInfo &info, uint32_t) override { NimBLEDevice::injectConfirmPasskey(info, true); }
@@ -748,7 +752,8 @@ static void readFireplaceState() {
   if (nHeater >= 1)  { g_regHeater[0] = heater[0]; g_regHeater[1] = nHeater > 1 ? heater[1] : 0; }
   if (nSetpoint >= 2) g_setpoint = setpoint[0] | (setpoint[1] << 8);
   if (nPower >= 1) g_regHeaterPower = power[0];
-  readRegister(g_chUnknown3c, g_regUnknown3c, 3); readRegister(g_chUnknown63, g_regUnknown63, 2);
+  if (readRegister(g_chUnknown3c, g_regUnknown3c, 3) >= 3) waterWatchUpdate(g_waterWatch, g_regControl[0] != 0, g_regUnknown3c, millis());
+  readRegister(g_chUnknown63, g_regUnknown63, 2);
   { uint8_t level[1]; if (readRegister(g_chFlameLevel, level, 1) >= 1) g_flameLevel = level[0]; }
   { uint8_t volume[1]; if (readRegister(g_chVolume, volume, 1) >= 1) g_volume = volume[0]; }
   if (!g_limitsRead && g_chSetpointLimits) {         // 0x001e = min, max setpoint (LE16 each), e.g. 0f00 1e00 = 15..30
@@ -1197,7 +1202,7 @@ static void bleTask(void *) {
 // =====================================================================================================
 // What was last published, so only changes are sent. -1 / empty = unknown (publish at the next chance).
 static int g_publishedBleEnabled = -1;       // 0/1
-static int g_publishedPower = -1, g_publishedFlameLevel = -1, g_publishedHeater = -1, g_publishedHeaterElement = -1;
+static int g_publishedPower = -1, g_publishedFlameLevel = -1, g_publishedHeater = -1, g_publishedHeaterElement = -1, g_publishedLowWater = -1;
 static int g_publishedHeaterPower = -1;        // 0 = low, 1 = high, 2 = unknown value
 static int g_publishedSetpoint = -1;           // degrees; SETPOINT_NONE = "unknown" was published (heater off)
 static int g_publishedTemperatureTenths = -1;  // tenths of a degree (243 = 24.3); SETPOINT_NONE = "unknown" was published
@@ -1265,7 +1270,7 @@ static void queueMqttCommand(CommandType type, int argument) {
 // Forget what was published, so the next publishChanges() sends everything again.
 static void forgetPublishedValues() {
   g_publishedBleEnabled = -1;
-  g_publishedPower = g_publishedFlameLevel = g_publishedHeater = g_publishedHeaterElement = g_publishedHeaterPower = g_publishedSetpoint = -1;
+  g_publishedPower = g_publishedFlameLevel = g_publishedHeater = g_publishedHeaterElement = g_publishedLowWater = g_publishedHeaterPower = g_publishedSetpoint = -1;
   g_publishedTemperatureTenths = -1; g_publishedRaw[0] = 0;
   g_publishedControlMode = g_publishedThermostat = -1;
   g_diagnosticsDue = true;
@@ -1331,6 +1336,8 @@ static void publishHomeAssistantDiscovery() {
                 "\",\"ic\":\"mdi:fire\"" + avail);
   publishEntity("binary_sensor", "heater_element", String("\"name\":\"Heater element\",\"uniq_id\":\"dimplex_heater_element\",\"stat_t\":\"") + TOPIC_HEATER_ELEMENT_STATE +
                 "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"dev_cla\":\"heat\",\"ic\":\"mdi:radiator\"" + avail);
+  publishEntity("binary_sensor", "low_water", String("\"name\":\"Low water\",\"uniq_id\":\"dimplex_low_water\",\"stat_t\":\"") + TOPIC_LOW_WATER_STATE +
+                "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"dev_cla\":\"problem\",\"ic\":\"mdi:water-alert\"" + avail);
   publishEntity("sensor", "heater_power", String("\"name\":\"Heater power\",\"uniq_id\":\"dimplex_heater_power\",\"stat_t\":\"") + TOPIC_HEATER_POWER_STATE +
                 "\",\"ic\":\"mdi:flash\"" + avail);
   publishEntity("sensor", "temperature", String("\"name\":\"Internal temperature\",\"uniq_id\":\"dimplex_temperature\",\"stat_t\":\"") + TOPIC_TEMPERATURE_STATE +
@@ -1444,6 +1451,7 @@ static void publishChanges(const SharedState &s) {
   if (!hold && (int) heaterOn != g_publishedHeater) { g_mqttClient.publish(TOPIC_HEATER_STATE, heaterOn ? "ON" : "OFF", true); g_publishedHeater = heaterOn; logLine("pub", "heater=%d", heaterOn); }
   bool elementOn = isHeaterOn(s);                           // the element itself: no echo hold, it is a read-only state
   if ((int) elementOn != g_publishedHeaterElement) { g_mqttClient.publish(TOPIC_HEATER_ELEMENT_STATE, elementOn ? "ON" : "OFF", true); g_publishedHeaterElement = elementOn; logLine("pub", "heater element=%d", elementOn); }
+  if ((int) s.lowWater != g_publishedLowWater) { g_mqttClient.publish(TOPIC_LOW_WATER_STATE, s.lowWater ? "ON" : "OFF", true); g_publishedLowWater = s.lowWater; logLine("pub", "low water=%d", s.lowWater); }
   int powerCode = (s.regHeaterPower == 0x01) ? 0 : (s.regHeaterPower == 0x03 ? 1 : 2);
   if (powerCode != g_publishedHeaterPower) {
     char text[12]; if (powerCode == 2) snprintf(text, sizeof(text), "raw %02x", s.regHeaterPower); else snprintf(text, sizeof(text), "%s", powerCode ? "high" : "low");
@@ -1665,6 +1673,7 @@ static String buildMainLive(const SharedState &s) {
   String connectedButton = connecting && !g_awaited[AW_BLE].active
                          ? "<a class='b wait' href='" + setHref("ble=on") + "'>Connected</a> "
                          : choiceButton("Connected", setHref("ble=on"), s.bleEnabled, AW_BLE, 1);
+  if (ready && s.lowWater) h += "<p class=msg style='background:#f8d7da'><b>Low water.</b> The mist maker is dry: fill the water tank or check that the mist maker sits in its opening. The fireplace switches the flame effect off by itself.</p>";
   h += "<h3>Bluetooth</h3>" + connectedButton + choiceButton("Released (use remote)", setHref("ble=off"), !s.bleEnabled, AW_BLE, 0);
   h += "<p class=dim>";
   if (!s.bleEnabled)  h += "Released: the original remote can connect. Values below are the last known.";
@@ -1759,7 +1768,7 @@ static String buildDebugLive(const SharedState &s, uint32_t pending) {
     h += "<tr><td>0x0042</td><td>" + String(s.flameLevel) + "</td><td>flame level</td></tr>";
     h += "<tr><td>0x0076</td><td>" + String(s.volume) + "</td><td>volume</td></tr>";
     h += String("<tr><td>0x0055</td><td>") + temperature + "</td><td>internal temperature</td></tr>";
-    h += String("<tr><td>0x003c</td><td>") + unknown3c + "</td><td>unknown measurement</td></tr>";
+    h += String("<tr><td>0x003c</td><td>") + unknown3c + "</td><td>mist maker load: ~1000-1100 in water, 3 dry (low water now: " + (s.lowWater ? "yes" : "no") + ")</td></tr>";
     h += String("<tr><td>0x0063</td><td>") + unknown63 + "</td><td>effect intensity</td></tr></table>";
     h += "<p class=dim>Read " + String((millis() - s.lastReadMs) / 1000) + " s ago &middot; limits " + String(s.setpointMin) + "&ndash;" + String(s.setpointMax) + " &deg;C</p>";
   } else h += "<p class=dim>No data (not connected).</p>";

@@ -115,6 +115,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | `dimplex/power/state` | `ON` / `OFF` | Flame effect |
 | `dimplex/heater/state` | `ON` / `OFF` | In a bridge mode: the user's wish for heating, not the momentary state of the element (so it stays `ON` while the target is reached) |
 | `dimplex/heater_element/state` | `ON` / `OFF` | The heating element of the fireplace is really on (register `0x0014`), in every mode. In a bridge mode it follows the thermostat, so it switches on and off while `heater/state` stays `ON` |
+| `dimplex/low_water/state` | `ON` / `OFF` | `ON` = the mist maker is dry (empty tank or lifted out of the water). Derived from register `0x003c` by `waterwatch.h` (section 5.6), retained. `OFF` while the flame effect is off, because nothing can be measured then |
 | `dimplex/setpoint/state` | degrees or `None` | Mode "Fireplace thermostat": `None` (unknown in Home Assistant) while the heater is off or before the first reading. Bridge modes: always the bridge setpoint |
 | `dimplex/level/state` | `1` to `6` | |
 | `dimplex/heater_power/state` | `low` / `high` / `raw xx` | |
@@ -133,6 +134,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | Fireplace | switch | `dimplex_power` |
 | Heating control (was "Heater") | switch | `dimplex_heater_switch` |
 | Heater element | binary sensor (heat) | `dimplex_heater_element` |
+| Low water | binary sensor (problem) | `dimplex_low_water` |
 | Setpoint | number (15 to 30) | `dimplex_setpoint_number` |
 | Flame intensity | number (1 to 6) | `dimplex_level` |
 | Bluetooth link | switch (config) | `dimplex_ble_link` |
@@ -234,7 +236,7 @@ One file, `Dimplex-Control.ino`, in numbered sections:
 | 8. LEDs | `ledTask` |
 | 9. Setup | Setup portal, `setup()`, `loop()` |
 
-Two more files in the same folder: `icons.h` holds the app icons as PNG byte arrays, and `thermostat.h` holds the types and the decision logic of the temperature control (section 5.5). `thermostat.h` is plain C++ without Arduino calls, so `test/thermostat_test.cpp` can test it on a PC.
+Three more files in the same folder: `icons.h` holds the app icons as PNG byte arrays, `waterwatch.h` holds the low water detection (section 5.6, also plain C++, tested by `test/waterwatch_test.cpp`), and `thermostat.h` holds the types and the decision logic of the temperature control (section 5.5). `thermostat.h` is plain C++ without Arduino calls, so `test/thermostat_test.cpp` can test it on a PC.
 
 All types (`struct`, `enum`) are defined above the first function. The Arduino IDE inserts automatic function prototypes before the first function, so a type defined after it breaks the build with errors like "does not name a type".
 
@@ -381,6 +383,18 @@ Issue #1: the fireplace's own thermostat kept the element running above the setp
 
 ---
 
+### 5.6 Low water detection
+Register `0x003c` reads about 1000 to 1100 with the mist maker under water and 3 when it is dry (experiments.md section 9). `waterwatch.h` (plain C++, tested by `test/waterwatch_test.cpp`) turns that into the state `lowWater`; `readFireplaceState()` feeds it after every read of the register, in `bleTask`, and `publishSnapshot()` copies the result to the shared state.
+
+- **On:** readings below 500 for at least 10 s (and at least 2 readings). **Off:** readings of 500 or more for at least 15 s. The off delay is longer on purpose: putting the mist maker back into its opening can take a few tries, and the sensor must not flap.
+- **Ignored:** `0xffff`, a reading that does not start with `01`, and the first 20 s after the flame effect has been switched on (start-up). They change nothing.
+- **Effect off:** the state is cleared (`OFF`) and the 20 s start-up period starts again on the next switch-on. In standby the register reads 0, so low water cannot be seen then; an alarm that was active therefore ends when the fireplace is switched off.
+- **Reset:** the state is cleared when the Bluetooth link goes down.
+- **No action:** the bridge only reports. The fireplace switches the flame effect off itself when it is dry; the heater is not touched by this detection.
+- **Web page:** a red notice on the Main page while low water is on; the Debug page shows the state next to register `0x003c`.
+
+---
+
 ## 6. Key flows
 
 ### 6.1 Boot
@@ -477,6 +491,7 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Thermostat in the bridge, in `bleTask` | The fireplace's own thermostat is unreliable. The bridge already owns the BLE link, so the control needs no new task and no new locking. |
 | Decision logic in `thermostat.h` | It has no hardware calls, so the hysteresis and the fail-safe are tested on a PC. |
 | Web Heating On starts the flame effect first | One press starts the heating. The web page sends `CMD_HEATER` with argument 2 (on, flame effect first); `bleSetHeater()` then switches the effect on, waits for the fireplace to confirm it and continues. The separate Flame effect and Heating buttons stay for doing it step by step. MQTT keeps the old rule so an automation never turns the flame on by surprise. |
+| Low water from `0x003c`, with a delay | A lift of the mist maker or a bubble on the disc must not raise an alarm, and putting the disc back can take a few tries, so on needs 10 s and off needs 15 s. The 0x0040 register does not show the shortage, `0x003c` does. |
 | Heater switch = wish in bridge modes | The element is off for part of the time; if the switch followed the element, Home Assistant would flip the switch off every cycle. The real state of the element is published separately on `dimplex/heater_element/state`. |
 | Fail-safe turns the heater off, not the whole fireplace | The flame effect is harmless; only the heating depends on a sensor value. |
 | Control mode only on the web page (Settings) | The issue asks for the web interface to choose it; it is a setting rather than a daily control, so it sits with the margins; Home Assistant shows it read-only. |
@@ -520,6 +535,7 @@ Dimplex Control is meant for a trusted home network. Known limits:
 ## 10. Testing
 
 - **Simulation on a PC.** The sketch is compiled with `g++ -Wall -Wextra` against stub versions of the Arduino, WiFi, WebServer, NimBLE, PubSubClient and related headers, with a simulated fireplace (optionally slow to report changes), a simulated broker and a simulated web client. About 90 checks cover: command execution and ordering, the web pages and live block, button feedback, fireplace selection and validation, factory reset, MQTT discovery and commands, the echo without flicker against a fireplace that needs 1.5 s, the deadband, Bluetooth release and resume, the LED states, a broker that does not answer, a lost BLE link in the middle of a command, and the crash diagnostics (previous session log, restart reason, planned restart, health sensors) and the Wi-Fi watchdog (with shortened delays).
+- **Unit test of the low water detection.** `test/waterwatch_test.cpp` replays the empty-tank test of 10 Nov (on, bounce while putting the mist maker back, off) and tests single odd readings, `0xffff`, start-up and standby: `g++ -std=c++17 -Wall -Wextra -I Dimplex-Control test/waterwatch_test.cpp -o waterwatch_test && ./waterwatch_test`.
 - **Unit test of the thermostat.** `test/thermostat_test.cpp` tests `thermostat.h` without stubs (hysteresis for both sensors, start rule, fail-safe and recovery, settings validation, parsing of MQTT payloads): `g++ -std=c++17 -Wall -Wextra -I Dimplex-Control test/thermostat_test.cpp -o thermostat_test && ./thermostat_test`.
 - **Measured in the simulation:** the slowest web request stayed in the order of a few milliseconds while BLE and MQTT were blocked.
 - **Not tested:** the real ESP32, the real NimBLE and Wi-Fi coexistence timing, the stack sizes, Home Assistant itself, and long-term behaviour (heap over 24 hours). The first real test of each of those is on the hardware. The Debug page shows the numbers needed (loop gap, request time, free stack, free heap).
