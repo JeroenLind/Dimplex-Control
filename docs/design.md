@@ -143,7 +143,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | Internal temperature | sensor | `dimplex_temperature` |
 | Temperature control | sensor | `dimplex_control_mode` |
 | Thermostat status | sensor | `dimplex_thermostat` |
-| Raw registers | sensor (diagnostic) | `dimplex_raw` |
+| Raw registers | sensor (diagnostic) | `dimplex_raw` (`3c=` and `63=` only) |
 | Last restart reason, Restart count, Uptime, Free memory, Lowest free memory, Wi-Fi signal, Wi-Fi drops, Last Wi-Fi outage, Bluetooth connections, MQTT connect failures, Free stack BLE task, Free stack MQTT task | sensors (diagnostic), all read from `dimplex/diag/state` | `dimplex_diag_restart_reason`, `dimplex_diag_restart_count`, `dimplex_diag_uptime`, `dimplex_diag_free_heap`, `dimplex_diag_min_heap`, `dimplex_diag_wifi`, `dimplex_diag_wifi_drops`, `dimplex_diag_wifi_outage`, `dimplex_diag_ble_connects`, `dimplex_diag_mqtt_failures`, `dimplex_diag_stack_ble`, `dimplex_diag_stack_mqtt` |
 
 Entities that existed in older versions (water sensor, volume, the read-only heater and setpoint sensors) are removed on connect by publishing an empty retained config.
@@ -158,7 +158,7 @@ Served by the Arduino `WebServer` on port 80 from `loop()`.
 |---|---|
 | `/` | Main page: Bluetooth link, flame effect, heating, setpoint, thermostat status, room temperature (room sensor mode), internal temperature |
 | `/settings` | Settings page: flame level, heater power, temperature control mode with margins and time-out, volume, fireplace selection (scan, address, passkey), factory reset |
-| `/debug` | Debug page: raw registers, temperature history, CSV download, system information, restart |
+| `/debug` | Debug page: the registers that are not understood yet (`0x003c`, `0x0063`), temperature history, CSV download, system information, restart |
 | `/live?p=<page>` | Only the live block of a page (HTML fragment); polled by the page script |
 | `/set?...` | Actions. Parameters: `ctl=fireplace/room/internal` (temperature control mode), `xoff`, `xon`, `ioff`, `ion` (margins in degrees) with `tmo` (time-out in minutes), `ble=on/off`, `fx=on/off`, `heater=on/off`, `hpwr=low/high`, `sp=<deg>`, `spd=<+/-1>`, `flame=1..6`, `vol=0..6`, `scan=1`, `fpaddr=<mac or auto>`, `pkey=<digits>`, `diag=reset`, `restart=1`, `factory=confirm`, plus `r=<page>` for the page to return to |
 | `/reset` | Confirmation page for the factory reset |
@@ -491,6 +491,7 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Thermostat in the bridge, in `bleTask` | The fireplace's own thermostat is unreliable. The bridge already owns the BLE link, so the control needs no new task and no new locking. |
 | Decision logic in `thermostat.h` | It has no hardware calls, so the hysteresis and the fail-safe are tested on a PC. |
 | Web Heating On starts the flame effect first | One press starts the heating. The web page sends `CMD_HEATER` with argument 2 (on, flame effect first); `bleSetHeater()` then switches the effect on, waits for the fireplace to confirm it and continues. The separate Flame effect and Heating buttons stay for doing it step by step. MQTT keeps the old rule so an automation never turns the flame on by surprise. |
+| Same two raw registers in all three places | The raw MQTT sensor, the Debug page and the CSV log only show registers that are not understood yet (`0x003c`, `0x0063`). Registers that are understood have their own entity or column (the CSV keeps the decoded columns: temperature, effect, heater, power, setpoint, flame level). A CSV row is also written when `0x0063` changes or `0x003c` crosses the wet/dry limit, so an empty tank is visible in the log. |
 | Low water from `0x003c`, with a delay | A lift of the mist maker or a bubble on the disc must not raise an alarm, and putting the disc back can take a few tries, so on needs 10 s and off needs 15 s. The 0x0040 register does not show the shortage, `0x003c` does. |
 | Heater switch = wish in bridge modes | The element is off for part of the time; if the switch followed the element, Home Assistant would flip the switch off every cycle. The real state of the element is published separately on `dimplex/heater_element/state`. |
 | Fail-safe turns the heater off, not the whole fireplace | The flame effect is harmless; only the heating depends on a sensor value. |

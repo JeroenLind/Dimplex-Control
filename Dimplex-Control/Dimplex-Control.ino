@@ -162,6 +162,7 @@ struct StatusSample {                       // one row of the temperature table 
   char temperatureText[8], temperatureRaw[8];   // "21.5" and the raw bytes of 0x0055
   uint8_t control0, control1, heater0, heaterPower, flameLevel;   // 0x0040 (2 bytes), 0x0014 byte 0, 0x0048, 0x0042
   uint16_t setpoint, unknown3c;             // 0x0018, 0x003c
+  uint8_t unknown63[2];                     // 0x0063
 };
 struct ScanEntry { char name[28]; char address[20]; int rssi; };   // one fireplace found by a BLE scan
 #define SCAN_MAX 8
@@ -729,11 +730,12 @@ static void logStatusSample() {
   n.uptimeSec = millis() / 1000; time_t now = time(nullptr); n.epoch = (now > 1700000000) ? (uint32_t) now : 0;
   strlcpy(n.temperatureText, text, sizeof(n.temperatureText)); bytesToHex(n.temperatureRaw, g_regTemperature, 3);
   n.control0 = g_regControl[0]; n.control1 = g_regControl[1]; n.heater0 = g_regHeater[0]; n.heaterPower = g_regHeaterPower;
-  n.flameLevel = g_flameLevel; n.setpoint = (uint16_t) g_setpoint; n.unknown3c = (uint16_t)(g_regUnknown3c[1] | (g_regUnknown3c[2] << 8));
+  n.flameLevel = g_flameLevel; n.setpoint = (uint16_t) g_setpoint; n.unknown3c = (uint16_t)(g_regUnknown3c[1] | (g_regUnknown3c[2] << 8)); memcpy(n.unknown63, g_regUnknown63, 2);
   const StatusSample &last = g_history[(g_historyHead + HISTORY_SIZE - 1) % HISTORY_SIZE];
   bool changed = (g_historyCount == 0) || strcmp(last.temperatureText, n.temperatureText) != 0 || last.control0 != n.control0 ||
                  last.control1 != n.control1 || last.heater0 != n.heater0 || last.heaterPower != n.heaterPower ||
-                 last.flameLevel != n.flameLevel || last.setpoint != n.setpoint;
+                 last.flameLevel != n.flameLevel || last.setpoint != n.setpoint ||
+                 memcmp(last.unknown63, n.unknown63, 2) != 0 || (last.unknown3c < WATER_DRY_BELOW) != (n.unknown3c < WATER_DRY_BELOW);   // 0x0063 and wet/dry (0x003c) are logged when they change
   if (changed || millis() - g_lastHistoryLogMs > 60000) {
     g_history[g_historyHead] = n;
     g_historyHead = (g_historyHead + 1) % HISTORY_SIZE; if (g_historyCount < HISTORY_SIZE) g_historyCount++;
@@ -1757,19 +1759,11 @@ static String buildDebugLive(const SharedState &s, uint32_t pending) {
 
   h += "<h3>Raw registers</h3>";
   if (ready) {
-    char control[6], heater[6], temperature[8], unknown3c[8], unknown63[6];
-    bytesToHex(control, s.regControl, 2); bytesToHex(heater, s.regHeater, 2); bytesToHex(temperature, s.regTemperature, 3);
+    char unknown3c[8], unknown63[6];                    // only the registers that are not understood yet (like the raw MQTT sensor and the CSV)
     bytesToHex(unknown3c, s.regUnknown3c, 3); bytesToHex(unknown63, s.regUnknown63, 2);
     h += "<table><tr><th>handle</th><th>value</th><th>meaning</th></tr>";
-    h += String("<tr><td>0x0040</td><td>") + control + "</td><td>main status (effect / heater)</td></tr>";
-    h += String("<tr><td>0x0014</td><td>") + heater + "</td><td>heater status</td></tr>";
-    h += "<tr><td>0x0018</td><td>" + String(s.setpoint) + "</td><td>setpoint &deg;C</td></tr>";
-    h += "<tr><td>0x0048</td><td>" + String(s.regHeaterPower, HEX) + "</td><td>heater power</td></tr>";
-    h += "<tr><td>0x0042</td><td>" + String(s.flameLevel) + "</td><td>flame level</td></tr>";
-    h += "<tr><td>0x0076</td><td>" + String(s.volume) + "</td><td>volume</td></tr>";
-    h += String("<tr><td>0x0055</td><td>") + temperature + "</td><td>internal temperature</td></tr>";
     h += String("<tr><td>0x003c</td><td>") + unknown3c + "</td><td>mist maker load: ~1000-1100 in water, 3 dry (low water now: " + (s.lowWater ? "yes" : "no") + ")</td></tr>";
-    h += String("<tr><td>0x0063</td><td>") + unknown63 + "</td><td>effect intensity</td></tr></table>";
+    h += String("<tr><td>0x0063</td><td>") + unknown63 + "</td><td>effect intensity (0 when the fireplace switches the effect off by itself)</td></tr></table>";
     h += "<p class=dim>Read " + String((millis() - s.lastReadMs) / 1000) + " s ago &middot; limits " + String(s.setpointMin) + "&ndash;" + String(s.setpointMax) + " &deg;C</p>";
   } else h += "<p class=dim>No data (not connected).</p>";
 
@@ -1931,17 +1925,16 @@ static void handleCsv() {
   setWebStep("csv");
   copySnapshot(g_webSnapshot);
   const SharedState &s = g_webSnapshot;
-  String out = "uptime_s;time;temp_c;temp_raw;effect;heater;heater_power;setpoint_c;flame_level;reg0040;reg0014;reg003c\n";
+  String out = "uptime_s;time;temp_c;temp_raw;effect;heater;heater_power;setpoint_c;flame_level;reg003c;reg0063\n";
   for (int i = s.historyCount - 1; i >= 0; i--) {
     const StatusSample &x = s.history[(s.historyHead - 1 - i + 2 * HISTORY_SIZE) % HISTORY_SIZE];
     char clockText[24] = "";
     if (x.epoch) { time_t e = x.epoch; struct tm t; localtime_r(&e, &t); strftime(clockText, sizeof(clockText), "%Y-%m-%d %H:%M:%S", &t); }
     bool heating = x.control0 != 0 && (x.heater0 & 0x04) == 0;
     char power[10]; if (x.heaterPower == 0x01) strcpy(power, "low"); else if (x.heaterPower == 0x03) strcpy(power, "high"); else snprintf(power, sizeof(power), "raw%02x", x.heaterPower);
-    char reg40[6]; snprintf(reg40, sizeof(reg40), "%02x%02x", x.control0, x.control1);
-    char reg14[4]; snprintf(reg14, sizeof(reg14), "%02x", x.heater0);
+    char reg63[6]; snprintf(reg63, sizeof(reg63), "%02x%02x", x.unknown63[0], x.unknown63[1]);
     out += String(x.uptimeSec) + ";" + clockText + ";" + x.temperatureText + ";" + x.temperatureRaw + ";" + (x.control0 ? "on" : "off") + ";" +
-           (heating ? "on" : "off") + ";" + power + ";" + String(x.setpoint) + ";" + String(x.flameLevel) + ";" + reg40 + ";" + reg14 + ";" + String(x.unknown3c) + "\n";
+           (heating ? "on" : "off") + ";" + power + ";" + String(x.setpoint) + ";" + String(x.flameLevel) + ";" + String(x.unknown3c) + ";" + reg63 + "\n";
   }
   if (g_webServer.hasArg("download")) g_webServer.sendHeader("Content-Disposition", "attachment; filename=dimplex-status-log.csv");
   g_webServer.send(200, g_webServer.hasArg("download") ? "text/csv" : "text/plain", out);
