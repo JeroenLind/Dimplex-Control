@@ -29,14 +29,14 @@ Confidence levels:
 | 0x0055 | 0x0008 | 3 B | R | `01 <degrees> <tenths>`, e.g. `011507` = 21.7 °C | **Temperature of the sensor inside the fireplace** (air near the heater), **not** the room temperature. It rises about 1 °C per minute with the heater on and keeps rising for several minutes after the heater is switched off; the fireplace has no external sensor. Resolution 0.1 °C, noise about ±0.1 °C | Almost certain |
 | 0x0076 | 0x4010 | 1 B | R/W | `03` | Volume 0 to 6 on models with a sound effect. The FI7539 has no sound effect; the register exists and reads `03` but its effect has not been verified on this unit | Plausible |
 | 0x0063 | 0x4004 | 2 B | R | `0000` standby; F1 `003a` (58), F2 `0042` (66), F3 `004b` (75), F6 `0064` (100) | **Intensity of the effect in %** for the current flame level, about 58 + 8.4 per step (so F4 about 83 and F5 about 92; not measured). Not the flame level itself (that is 0x0042) | Certain that it follows 0x0042; unit % plausible |
-| 0x003c | 0x4003 | 3 B | R | `010000` standby, then roughly 960 to 1050 (`01` + LE16) | Measured value of unknown unit. Not related to flame level or heater power; roughly follows time and temperature. `ffff` (65535) occasionally appears as an invalid reading, also in standby | Unknown |
+| 0x003c | 0x4003 | 3 B | R | `010000` standby, then roughly 960 to 1050 (`01` + LE16) | **Probably the load of the ultrasonic mist maker: in water or dry** (see experiments.md section 9). With water and the effect on it reads about 1000 to 1100 (a few % higher with the heater on); with an empty tank it fell to **3** (`010300`) within seconds, and returned to ~1060 after refilling. Noise of about ±15 per reading. The bridge turns it into the Home Assistant sensor *Low water* (design.md section 5.6). `ffff` (65535) occasionally appears as an invalid reading, also in standby | Plausible (one empty-tank test) |
 | 0x004d | 0x0002 | 3 B | R | `010000` / `010100` | Byte 2 is 1 while the flame effect is on ("effect active" flag) | Plausible |
 | 0x005d | 0x4000 | 2 B | R | `0100` standby / `0164` effect on | Byte 2 = 0x64 (100) while the effect is on: "on + intensity" | Plausible |
 | 0x005f, 0x0065 | 0x4001, 0x4005 | 2 B | R | `0100` standby / `0101` effect on | Byte 2 follows "effect on" | Plausible |
 | 0x0053 | 0x0007 | 1 B | R | `00` or `03` | Becomes `03` after the fireplace has been switched off for the first time after power-up, and then stays `03` (also with effect and heater on). Not an effect flag; probably a session or start-up state | Unknown |
-| 0x0051 | 0x0004 | 2 B | R | `0100` / `0101` | Changes on its own (counter or measurement). Not a setting | Unknown |
+| 0x0051 | 0x0004 | 2 B | R | `0100` / `0101` | Changes on its own (counter or measurement). Not a setting. **Watched** since 11 Nov (raw MQTT sensor `51=`, Debug page, CSV `reg0051`): compare with a power meter to see whether it follows the heating element | Unknown |
 
-**Byte 2 of 0x0040.** It is `01` while the flame effect is on and still `01` about a minute after switching off, but `00` after about half an hour. This fits an "effect active or just switched off" flag (run-on time). Whether it also indicates a low water level (the manual mentions two beeps) has not been tested with an empty tank.
+**Byte 2 of 0x0040.** It is `01` while the flame effect is on and still `01` about a minute after switching off, but `00` after about half an hour. This fits an "effect active or just switched off" flag (run-on time). It does **not** indicate a low water level: with an empty tank byte 2 stayed `01` (10 Nov, experiments.md section 9).
 
 ## 2. Command sequences
 
@@ -137,11 +137,11 @@ All of these were constant in every observation unless noted, and their meaning 
 |---|---|---|---|
 | 0x0020 | 0x1007 | 9x `00` | |
 | 0x0022 | 0x1008 | `00` | |
-| 0x0024 | 0x100d | `00` | |
-| 0x0026 | 0x1011 | `00` | Was `35` (53) once, so not strictly constant: counter or measurement? |
+| 0x0024 | 0x100d | `00` | Polled by the remote. **Watched** since 11 Nov (`24=`, CSV `reg0024`): a change could be a fault flag |
+| 0x0026 | 0x1011 | `00` | Was `35` (53) once, so not strictly constant: counter or measurement? **Watched** since 11 Nov (`26=`, CSV `reg0026`) |
 | 0x0030 | 0x1016 | `0010` | |
 | 0x0032 | 0x1017 | `0003` | |
-| 0x0036 | 0x1027 | `0000` | |
+| 0x0036 | 0x1027 | `0000` | Polled by the remote. **Watched** since 11 Nov (`36=`, CSV `reg0036`): a change could be a fault flag |
 | 0x003a | 0x102a | `0013010100000700` | looks like the date 2019-01-01 (factory date?) |
 | 0x003e | 0x4006 | `010000` | |
 | 0x0044 | 0x400a | `0a02` | |
@@ -182,14 +182,14 @@ All of these were constant in every observation unless noted, and their meaning 
 | Mode selection: timer / manual / frost protection | not found | Open |
 | °C / °F | 0x001c (?) | Unknown |
 | Adaptive Start, child lock | not found | Open |
-| Low water warning (two beeps) | 0x0040 byte 2 (?) | Unknown |
+| Low water warning (two beeps) | 0x003c drops to 3; 0x0063 briefly 0 (effect off, about 150 W less); 0x0040 and 0x0014 do not change | Plausible (one test) |
 
 ## 10. Open questions
 
 - Mode selection (manual / timer / frost protection) and how the timer is switched on and off.
 - The daylight-saving flag in the clock (does it change when the clock is set in winter time?).
 - °C/°F and the meaning of 0x001c.
-- The meaning of 0x0053, 0x0051, 0x0026 and 0x003c.
+- The meaning of 0x0053, 0x0051 and 0x0026, and the exact unit and threshold of 0x003c (what value counts as empty).
 - Intensity values for F4 and F5 in 0x0063.
 - Behaviour of byte 2 of 0x0040 with an empty water tank.
 - Which measurement the fireplace uses internally for its thermostat.
