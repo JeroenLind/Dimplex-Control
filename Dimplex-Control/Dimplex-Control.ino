@@ -118,6 +118,10 @@ static const char *TOPIC_POWER_SET          = "dimplex/power/set";          // f
 static const char *TOPIC_POWER_STATE        = "dimplex/power/state";
 static const char *TOPIC_FLAME_LEVEL_SET    = "dimplex/level/set";          // 1..6
 static const char *TOPIC_FLAME_LEVEL_STATE  = "dimplex/level/state";
+static const char *TOPIC_VOLUME_SET         = "dimplex/volume/set";         // 0..6 (0 = sound off)
+static const char *TOPIC_VOLUME_STATE       = "dimplex/volume/state";
+static const char *TOPIC_SOUND_SET          = "dimplex/sound/set";          // ON = last volume above 0 (or 3), OFF = volume 0
+static const char *TOPIC_SOUND_STATE        = "dimplex/sound/state";
 static const char *TOPIC_HEATER_SET         = "dimplex/heater/set";         // ON/OFF
 static const char *TOPIC_HEATER_STATE       = "dimplex/heater/state";       // the Heater switch: heater on (0x0014 byte0, bit 0x04 clear); with bridge control: the user's wish for heating
 static const char *TOPIC_HEATER_ELEMENT_STATE = "dimplex/heater_element/state"; // ON/OFF: the heating element of the fireplace is really on (0x0014), also with bridge control
@@ -574,7 +578,6 @@ static bool findFireplaceCharacteristics() {
         case 0x0040: g_chControl = c; break;          // effect / heater state
         case 0x0042: g_chFlameLevel = c; break;       // flame intensity 1..6
         case 0x0012: g_chClock = c; break;
-        case 0x0087: g_chInit = c; break;
         case 0x0014: g_chHeater = c; break;           // heater state byte
         case 0x0018: g_chSetpoint = c; break;
         case 0x0048: g_chHeaterPower = c; break;
@@ -586,10 +589,14 @@ static bool findFireplaceCharacteristics() {
         case 0x0036: g_chExtra36 = c; break;          // watched only (polled by the remote, always 0 so far)
         case 0x0024: g_chExtra24 = c; break;          // watched only (polled by the remote, always 0 so far)
         case 0x001e: g_chSetpointLimits = c; break;
-        case 0x0076: g_chVolume = c; break;           // volume (models with a sound effect only)
         default: break;
       }
+      // From handle 0x0074 on the handles differ between units (some have one characteristic less, which shifts the rest
+      // by 2: volume is 0x0074 instead of 0x0076, the handshake 0x0085 instead of 0x0087). These two are unique by UUID.
+      if (c->getUUID() == NimBLEUUID((uint16_t) 0x4010)) g_chVolume = c;      // volume (models with a sound effect only)
+      if (c->getUUID() == NimBLEUUID((uint16_t) 0x2001)) g_chInit = c;        // handshake register
     }
+  logLine("ble", "volume register at 0x%04x, handshake register at 0x%04x", g_chVolume ? g_chVolume->getHandle() : 0, g_chInit ? g_chInit->getHandle() : 0);
   return g_chControl != nullptr;
 }
 
@@ -1007,7 +1014,7 @@ static bool bleSetHeaterPower(bool high) {
 }
 
 static int g_awaitedVolume = 0;                  // target of the volume command being confirmed (bleTask only)
-// Volume: 0x0076 = 0..6. Only models with a sound effect react to it.
+// Volume: UUID 0x4010 (handle 0x0076, or 0x0074 on units with one characteristic less) = 0..6. Only models with a sound effect react to it.
 static bool bleSetVolume(uint8_t volume) {
   if (!g_bleReady || !g_chVolume) { setMessage("Not connected to the fireplace"); return false; }
   if (volume > 6) volume = 6;
@@ -1221,6 +1228,8 @@ static void bleTask(void *) {
 static int g_publishedBleEnabled = -1;       // 0/1
 static int g_publishedPower = -1, g_publishedFlameLevel = -1, g_publishedHeater = -1, g_publishedHeaterElement = -1, g_publishedLowWater = -1;
 static int g_publishedHeaterPower = -1;        // 0 = low, 1 = high, 2 = unknown value
+static int g_publishedVolume = -1;             // 0..6
+static uint8_t g_lastSoundVolume = 3;          // volume the Sound switch goes back to when it is switched on
 static int g_publishedSetpoint = -1;           // degrees; SETPOINT_NONE = "unknown" was published (heater off)
 static int g_publishedTemperatureTenths = -1;  // tenths of a degree (243 = 24.3); SETPOINT_NONE = "unknown" was published
 static int g_publishedControlMode = -1;        // ControlMode
@@ -1287,7 +1296,7 @@ static void queueMqttCommand(CommandType type, int argument) {
 // Forget what was published, so the next publishChanges() sends everything again.
 static void forgetPublishedValues() {
   g_publishedBleEnabled = -1;
-  g_publishedPower = g_publishedFlameLevel = g_publishedHeater = g_publishedHeaterElement = g_publishedLowWater = g_publishedHeaterPower = g_publishedSetpoint = -1;
+  g_publishedPower = g_publishedFlameLevel = g_publishedHeater = g_publishedHeaterElement = g_publishedLowWater = g_publishedHeaterPower = g_publishedSetpoint = g_publishedVolume = -1;
   g_publishedTemperatureTenths = -1; g_publishedRaw[0] = 0;
   g_publishedControlMode = g_publishedThermostat = -1;
   g_diagnosticsDue = true;
@@ -1333,7 +1342,6 @@ static void publishHomeAssistantDiscovery() {
   setMqttStep("publishing discovery");
   String avail = String(",\"avty_t\":\"") + TOPIC_AVAILABILITY + "\"";
   removeEntity("binary_sensor", "water");
-  removeEntity("number", "volume");
   removeEntity("binary_sensor", "heater");     // replaced by the heater switch
   removeEntity("sensor", "setpoint");          // replaced by the setpoint number
   // ---- controls ----
@@ -1341,6 +1349,10 @@ static void publishHomeAssistantDiscovery() {
                 "\",\"stat_t\":\"" + TOPIC_POWER_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ic\":\"mdi:fireplace\"" + avail);
   publishEntity("number", "level", String("\"name\":\"Flame intensity\",\"uniq_id\":\"dimplex_level\",\"cmd_t\":\"") + TOPIC_FLAME_LEVEL_SET +
                 "\",\"stat_t\":\"" + TOPIC_FLAME_LEVEL_STATE + "\",\"min\":1,\"max\":6,\"step\":1,\"mode\":\"slider\",\"ic\":\"mdi:fire\"" + avail);
+  publishEntity("number", "volume", String("\"name\":\"Volume\",\"uniq_id\":\"dimplex_volume\",\"cmd_t\":\"") + TOPIC_VOLUME_SET +
+                "\",\"stat_t\":\"" + TOPIC_VOLUME_STATE + "\",\"min\":0,\"max\":6,\"step\":1,\"mode\":\"slider\",\"ic\":\"mdi:volume-high\"" + avail);
+  publishEntity("switch", "sound", String("\"name\":\"Sound\",\"uniq_id\":\"dimplex_sound\",\"cmd_t\":\"") + TOPIC_SOUND_SET +
+                "\",\"stat_t\":\"" + TOPIC_SOUND_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ic\":\"mdi:volume-high\"" + avail);
   publishEntity("switch", "heater_switch", String("\"name\":\"Heating control\",\"uniq_id\":\"dimplex_heater_switch\",\"cmd_t\":\"") + TOPIC_HEATER_SET +
                 "\",\"stat_t\":\"" + TOPIC_HEATER_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ic\":\"mdi:radiator\"" + avail);
   publishEntity("number", "setpoint_number", String("\"name\":\"Setpoint\",\"uniq_id\":\"dimplex_setpoint_number\",\"cmd_t\":\"") + TOPIC_SETPOINT_SET +
@@ -1386,6 +1398,11 @@ static void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     int level = atoi(text); if (level < 1) level = 1; if (level > 6) level = 6;
     queueMqttCommand(CMD_FLAME_LEVEL, level);
   }
+  else if (!strcmp(topic, TOPIC_VOLUME_SET)) {                                                                     // volume 0..6
+    int volume = atoi(text); if (volume < 0) volume = 0; if (volume > 6) volume = 6;
+    queueMqttCommand(CMD_VOLUME, volume);
+  }
+  else if (!strcmp(topic, TOPIC_SOUND_SET))      queueMqttCommand(CMD_VOLUME, isOn ? g_lastSoundVolume : 0);         // sound on/off
 }
 
 // Resolve the configured broker and point PubSubClient at it: numeric IP, *.local (mDNS) or plain DNS name.
@@ -1421,6 +1438,7 @@ static bool tryMqttConnect() {
     g_mqttClient.subscribe(TOPIC_POWER_SET); g_mqttClient.subscribe(TOPIC_FLAME_LEVEL_SET);
     g_mqttClient.subscribe(TOPIC_HEATER_SET); g_mqttClient.subscribe(TOPIC_SETPOINT_SET); g_mqttClient.subscribe(TOPIC_BLE_SET);
     g_mqttClient.subscribe(TOPIC_ROOM_TEMPERATURE_SET);
+    g_mqttClient.subscribe(TOPIC_VOLUME_SET); g_mqttClient.subscribe(TOPIC_SOUND_SET);
     publishHomeAssistantDiscovery();
     forgetPublishedValues();                       // republish everything after (re)connecting
     waitMs = 3000; failures = 0;
@@ -1463,6 +1481,12 @@ static void publishChanges(const SharedState &s) {
   if (s.flameLevel >= 1 && s.flameLevel != g_publishedFlameLevel) {          // 0x0042 = flame intensity (independent of power)
     char text[4]; snprintf(text, sizeof(text), "%u", s.flameLevel); g_mqttClient.publish(TOPIC_FLAME_LEVEL_STATE, text, true); g_publishedFlameLevel = s.flameLevel;
     logLine("pub", "level=%u", s.flameLevel);
+  }
+  if ((int) s.volume != g_publishedVolume) {                                 // volume 0..6 and the Sound switch (on = above 0)
+    char text[4]; snprintf(text, sizeof(text), "%u", s.volume); g_mqttClient.publish(TOPIC_VOLUME_STATE, text, true);
+    g_mqttClient.publish(TOPIC_SOUND_STATE, s.volume > 0 ? "ON" : "OFF", true);
+    if (s.volume > 0 && s.volume <= 6) g_lastSoundVolume = s.volume;
+    g_publishedVolume = s.volume; logLine("pub", "volume=%u", s.volume);
   }
   bool heaterOn = isHeaterSwitchOn(s);                      // with bridge control: the user's wish, not the momentary state of the element
   if (!hold && (int) heaterOn != g_publishedHeater) { g_mqttClient.publish(TOPIC_HEATER_STATE, heaterOn ? "ON" : "OFF", true); g_publishedHeater = heaterOn; logLine("pub", "heater=%d", heaterOn); }
