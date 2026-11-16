@@ -16,7 +16,7 @@ int main() {
   uint8_t r[3];
   reg(r, 1050); CHECK(waterReading(r) == 1050);
   reg(r, 3);    CHECK(waterReading(r) == 3);
-  reg(r, 0);    CHECK(waterReading(r) == 0);
+  reg(r, 0);    CHECK(waterReading(r) == -1);                                   // 0 is no measurement (standby, start-up)
   reg(r, 0xffff); CHECK(waterReading(r) == -1);
   r[0] = 0x00; r[1] = 0x10; r[2] = 0x04; CHECK(waterReading(r) == -1);       // does not start with 01
 
@@ -55,10 +55,23 @@ int main() {
 
   // --- grace period after the effect is switched on ---
   waterWatchReset(w);
-  CHECK(!feed(w, true, 0, 1000)); CHECK(!feed(w, true, 3, 6000)); CHECK(!feed(w, true, 3, 11000)); CHECK(!feed(w, true, 3, 16000));
+  CHECK(!feed(w, true, 3, 1000)); CHECK(!feed(w, true, 3, 6000)); CHECK(!feed(w, true, 3, 11000)); CHECK(!feed(w, true, 3, 16000));
   CHECK(!feed(w, true, 3, 21000));                                             // 20 s after start: first counted reading
   CHECK(!feed(w, true, 3, 26000));
   CHECK(feed(w, true, 3, 31000));                                              // and 10 s later: low water
+
+  // --- start-up of the effect (12 Nov 16:18:49 and 13 Nov 05:32:34): for about 50 s the register alternates 0 and 0xffff, then it
+  //     reads ~950. This used to give a false low water of about 30 s because 0 counted as dry. ---
+  waterWatchReset(w);
+  const int startup[] = {0xffff, 0xffff, 0, 0, 0xffff, 0, 0, 0xffff, 0xffff, 0, 0xffff, 0, 0xffff, 951, 967, 972, 981, 1000, 977};
+  for (int i = 0; i < 19; i++) CHECK(!feed(w, true, startup[i], 1000 + 5000u * i));
+
+  // --- the real run-out of 13 Nov 11:14:42: ~1120 in one step to 3, restart ~50 s after the water is back ---
+  waterWatchReset(w); feed(w, true, 1110, 0);
+  for (uint32_t t = 25000; t < 60000; t += 5000) CHECK(!feed(w, true, 1100 + (int)(t % 30), t));
+  CHECK(!feed(w, true, 3, 60000)); CHECK(!feed(w, true, 3, 65000)); CHECK(feed(w, true, 3, 70000));        // on 10 s after the step
+  for (uint32_t t = 75000; t < 600000; t += 5000) CHECK(feed(w, true, 3, t));                                // stays on while dry
+  CHECK(feed(w, true, 974, 600000)); CHECK(feed(w, true, 991, 605000)); CHECK(feed(w, true, 983, 610000)); CHECK(!feed(w, true, 989, 615000));
 
   // --- effect off (standby, or a switch-off by the user): state cleared, and the grace period starts again ---
   CHECK(!feed(w, false, 0, 40000));

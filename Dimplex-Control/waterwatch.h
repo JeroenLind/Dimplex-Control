@@ -5,12 +5,13 @@
  *
  * WHAT IS MEASURED
  *   Register 0x003c (`01` + LE16) is, as far as we know, a measurement of the load on the ultrasonic mist maker (see
- *   docs/experiments.md section 9). With the disc under water and the flame effect on it reads about 1000 to 1100. With the disc
- *   out of the water (empty tank, or lifted out by hand) it falls to 3. Other values:
- *     0x0000      the effect is off (standby): no measurement
- *     0xffff      invalid reading, also seen right after the effect starts
- *   The fireplace switches the effect off by itself when it is dry, but register 0x0040 does not change, so 0x003c is the
- *   signal to use.
+ *   docs/experiments.md sections 9 and 10). With the disc under water and the effect running it reads about 950 to 1150 (it climbs
+ *   from ~990 to ~1130 in the first 2 to 3 hours). With the disc out of the water (empty tank, or lifted out by hand) it falls to
+ *   2 or 3 in one step. Other values:
+ *     0x0000 and 0xffff   no measurement: they alternate in standby and during the ~50 s start-up of the effect (while 0x0063 is
+ *                         still 0). They are NOT dry readings.
+ *   The fireplace switches the effect off by itself when it is dry (0x0063 goes to 0 within ~10 s). Byte 2 of 0x0040 follows only
+ *   after about 70 s, so 0x003c is the signal to use.
  *
  * WHEN IS THERE "LOW WATER"
  *   The reading must be below WATER_DRY_BELOW for WATER_DRY_HOLD_MS (and at least 2 readings) to switch low water on, and at or
@@ -18,7 +19,7 @@
  *   a short lift while the disc is put back therefore does not flip the sensor. Readings are ignored (neither dry nor wet) while:
  *     - the flame effect is off (and the state is cleared: without the effect nothing can be measured),
  *     - the effect has been on for less than WATER_GRACE_MS (start-up),
- *     - the reading is 0xffff or does not start with 0x01.
+ *     - the reading is 0 or 0xffff (no measurement) or does not start with 0x01.
  */
 #pragma once
 #include <stdint.h>
@@ -45,7 +46,7 @@ static inline void waterWatchReset(WaterWatch &w) {
 static inline int waterReading(const uint8_t reg[3]) {
   if (reg[0] != 0x01) return -1;
   int v = reg[1] | (reg[2] << 8);
-  return v == 0xffff ? -1 : v;
+  return (v == 0xffff || v == 0) ? -1 : v;               // 0 and 0xffff alternate when nothing is measured (standby, effect start-up)
 }
 
 // Call once for every successful read of 0x003c. effectOn = the flame effect is switched on (0x0040 byte 0 is not 0).
