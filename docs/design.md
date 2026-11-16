@@ -387,7 +387,7 @@ Issue #1: the fireplace's own thermostat kept the element running above the setp
 Register `0x003c` reads about 1000 to 1100 with the mist maker under water and 3 when it is dry (experiments.md section 9). `waterwatch.h` (plain C++, tested by `test/waterwatch_test.cpp`) turns that into the state `lowWater`; `readFireplaceState()` feeds it after every read of the register, in `bleTask`, and `publishSnapshot()` copies the result to the shared state.
 
 - **On:** readings below 500 for at least 10 s (and at least 2 readings). **Off:** readings of 500 or more for at least 15 s. The off delay is longer on purpose: putting the mist maker back into its opening can take a few tries, and the sensor must not flap.
-- **Ignored:** `0xffff`, a reading that does not start with `01`, and the first 20 s after the flame effect has been switched on (start-up). They change nothing.
+- **Ignored:** `0` and `0xffff` (no measurement: both alternate in standby and during the ~50 s start-up of the effect, while 0x0063 is still 0), a reading that does not start with `01`, and the first 20 s after the flame effect has been switched on. They change nothing. Counting `0` as dry gave two false alarms in the four-day replay (experiments.md section 10).
 - **Effect off:** the state is cleared (`OFF`) and the 20 s start-up period starts again on the next switch-on. In standby the register reads 0, so low water cannot be seen then; an alarm that was active therefore ends when the fireplace is switched off.
 - **Reset:** the state is cleared when the Bluetooth link goes down.
 - **No action:** the bridge only reports. The fireplace switches the flame effect off itself when it is dry; the heater is not touched by this detection.

@@ -187,7 +187,7 @@ Use Lammerink's method: dump A, disconnect the ESP32, change **one** setting on 
 6. **°C -> °F and lowering the maximum setpoint**, for 0x001c and 0x001e.
 7. **DST on/off** and moving the clock by an hour, for the flag in 0x0010 (DST ends on 25 October 2026 in Europe).
 8. **Water and run-on time:** dumps every minute after switching off for 0x0040 byte 2. ~~Effect on with an empty tank~~ **done** (section 9): 0x003c drops to 3. Still to do: slowly lowering the water level to find the value at which the fireplace beeps.
-9. **Other unknown registers:** 0x0051 (flips on its own), 0x0053, 0x0026. First only observe, then interpret. Since 11 Nov the bridge watches 0x0051, 0x0026, 0x0036 and 0x0024 (raw MQTT sensor, Debug page, CSV); to do: run with a power meter and compare 0x0051 with the heating element switching, and note any change of the other three. 0x003c is explained in section 9.
+9. **Other unknown registers:** 0x0051 (flips on its own), 0x0053, 0x0026. First only observe, then interpret. Since 11 Nov the bridge watches 0x0051, 0x0026, 0x0036 and 0x0024 (raw MQTT sensor, Debug page, CSV). Section 10: 0x0051 flips in standby too, so it is not the heating element; still to do: a run with the heater on and the power meter to see if it follows anything, and note any change of the other three. 0x003c is explained in section 9.
 10. ~~Temperature source 0x0055~~ **settled:** internal fireplace sensor (section 5).
 11. **Thermostat:** set the setpoint below the room temperature (e.g. 16 with a room at 18) with a power meter and see whether the heating element switches off, and set it a few degrees above to check it keeps heating. Section 8 shows the element does not follow 0x0055 reaching the setpoint.
 12. **History:** the bridge keeps about 120 rows (one row per change or per minute). For longer logs: lower the logging frequency or enlarge the buffer.
@@ -213,6 +213,34 @@ Setup: effect on, heater on (low power, setpoint 18), flame level F1. At about 1
 - **0x0040 and 0x0014 do not change.** Byte 2 of 0x0040 is therefore not a low water indicator, and the "flame effect on" bit stays set while the lamps are off. A bridge that wants to detect low water has to read 0x003c (and 0x0063).
 - **Normal range.** Over 469 readings with water: 1002 to 1098, mean 1029 with the heater off and 1059 with the heater on. In the heater-on window the value correlates a little with the internal temperature (r = 0.41); with the heater off there is no correlation (r = 0.03). The change is small against the gap to 3, so a threshold anywhere between 100 and 900 separates the cases. The value at which the fireplace itself beeps is not known (only empty and full were tried).
 - **Not yet known:** the transition values (a tank that is nearly empty), whether the fireplace beeps with `0x003c` = 3 and what happens to 0x003c when the effect is off for a long time (standby gives `010000`).
+
+## 10. Four days of history, 10 to 14 Nov (a real dry run on 13 Nov)
+
+Source: Home Assistant history of the raw registers (older format `40 14 18 48 55 3c 63`, about 54,000 rows, one every 5 s) with the power meter of the fireplace. The export is in UTC.
+
+**Real run-out on 13 Nov, 11:14:42 UTC.** The effect had been on for a long time and ran out of water (no test this time).
+
+| UTC | 0x003c | 0x0063 | 0x0040 | Power |
+|---|---|---|---|---|
+| until 11:14:37 | 1110-1136 | `003a` | `0601` | 170 W |
+| 11:14:42 | **3** in one step (no decline before it) | `003a` | `0601` | |
+| 11:14:52 | 3 | **`0000`** (effect off, about 10 s later) | `0601` | 0-159 W |
+| 11:15:53 | 3 | `0000` | **`0600`** (byte 2 falls to 0 about 70 s after the step) | 0 W |
+| 16:10:54 | back to **974** (water added) | `0000` | `0100` | |
+| 16:11:45 | 1010 | `0100`, 4 s later `003a` | `0101` | 977 W |
+
+- **The effect is off for 5 hours, the heater is not.** The fireplace kept heating at about 820 W (low power, with the effect off) for hours, in several heating periods, while the mist maker was dry. The fireplace has no dry-run protection for the heater; only the mist and the flames stop. With the effect running the same heater draws about 975 W, so the effect itself is about 155 W.
+- **0x003c does not announce the empty tank.** Over the hours before, it was stable at 1095 to 1165. The value goes from about 1120 to 3 between two readings.
+- **After refilling, 0x003c reacts first, the effect follows much later.** The value was back at 974 within one reading of the water being added (16:10:54). The effect started again 51 s later (`0100` at 16:11:45, `003a` at 16:11:49); in the test of 10 Nov it was about 17 s.
+- **Byte 2 of 0x0040 does follow, but late.** It is `01` while the mist is really running and falls to `00` about 70 s after the water has gone (in the 47 s test of 10 Nov it had not fallen yet, which fits). It also is `00` for about 50 s right after the effect has been switched on, until the mist starts. After switching off it stays `01` for a while (`0001`, 56 rows). So byte 2 is a "mist maker is running" flag that lags.
+
+**Start-up of the effect (about 50 s).** After `0x0040` becomes `0600`, 0x003c alternates between `0000` and `ffff` for about 50 s while 0x0063 is still 0. Then 0x0063 becomes `0100` (once) and `003a`, byte 2 of 0x0040 becomes `01`, and 0x003c reads about 950 to 1000 (12 Nov 16:18:49 to 16:19:42; 13 Nov 05:32:34 to 05:33:24). The same alternation of `0000` and `ffff` is what 0x003c shows in standby (11,023 runs of 0 and 11,020 runs of `ffff`). So **0 and `ffff` both mean "nothing is measured"**, not "invalid".
+
+**Consequence for the Low water sensor.** Version 1 counted 0 as a dry reading, and the 20 s start-up wait was shorter than the real 50 s. Replaying the four days showed two false alarms (12 Nov 16:19:21 for 36 s and 13 Nov 05:33:14 for 25 s). Fixed: 0 and `ffff` are now ignored. The replay of the corrected logic gives only the two real events: the test of 10 Nov (on 15:30:19, off 15:31:09) and the run-out of 13 Nov (on 11:14:52, 10 s after the step; off 16:11:09, 15 s after the water was back).
+
+**0x003c warms up.** In 7 sessions (effect running, 80 to 340 minutes) the value starts at 984 to 1024 in the first 5 minutes, rises about 1.5 % per 30 min and flattens at about 1100 to 1130 after 2 to 3 hours (per 30 min: 1014, 1062, 1090, 1108, 1122, 1127, 1130). Every session starts at about 990 again, also when the previous one ended an hour before. This looks like the temperature of the water or the disc, not the water level. It does not touch the wet/dry limit (about 950 or more against 3).
+
+**New registers (about 6 minutes, 29 rows, all in standby).** `0x0051` flips between `0100` and `0101` all the time **in standby, with the heater off**: it is therefore not the state of the heating element. `0x0026`, `0x0036` and `0x0024` stayed `00`, `0000` and `00`. A run with the heater on has not been logged yet.
 
 ## 8. Home Assistant history of 19 Oct (bridge via MQTT, power meter, room sensor)
 
