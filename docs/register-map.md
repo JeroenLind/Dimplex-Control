@@ -27,7 +27,7 @@ Confidence levels:
 | 0x0048 | 0x4012 | 1 B | R/W | `01` low / `03` high | **Heater power:** `01` = low (0.9 kW), `03` = high (1.8 kW). The setting is stored by the fireplace: it is kept when the heater or the fireplace is switched off and after the controller restarts. Not tested after a mains power reset. Other values have not been seen | Certain |
 | 0x004f | 0x0003 | 2 B | R | `0100` low / `0101` high | Byte 2 follows the heater power setting | Plausible |
 | 0x0055 | 0x0008 | 3 B | R | `01 <degrees> <tenths>`, e.g. `011507` = 21.7 °C | **Temperature of the sensor inside the fireplace** (air near the heater), **not** the room temperature. It rises about 1 °C per minute with the heater on and keeps rising for several minutes after the heater is switched off; the fireplace has no external sensor. Resolution 0.1 °C, noise about ±0.1 °C | Almost certain |
-| 0x0076 | 0x4010 | 1 B | R/W | `03` | Volume 0 to 6 on models with a sound effect. The FI7539 has no sound effect; the register exists and reads `03` but its effect has not been verified on this unit | Plausible |
+| 0x0076 (0x0074 on units with one characteristic less) | 0x4010 | 1 B | R/W | `03` | Volume 0 to 6 on models with a sound effect. The FI7539 has no sound effect; the register exists and reads `03` but its effect has not been verified on this unit | Plausible |
 | 0x0063 | 0x4004 | 2 B | R | `0000` standby; F1 `003a` (58), F2 `0042` (66), F3 `004b` (75), F6 `0064` (100) | **Intensity of the effect in %** for the current flame level, about 58 + 8.4 per step (so F4 about 83 and F5 about 92; not measured). Not the flame level itself (that is 0x0042) | Certain that it follows 0x0042; unit % plausible |
 | 0x003c | 0x4003 | 3 B | R | `010000` and `01ffff` alternate when nothing is measured (standby, effect start-up); about 950 to 1150 in water (`01` + LE16); 3 dry | **Probably the load of the ultrasonic mist maker: in water or dry** (see experiments.md sections 9 and 10). With water and the effect running it reads about 950 to 1150; with an empty tank it fell to **3** (`010300`) in one step, also in a real run-out on 13 Nov, and returned to ~975 within one reading of refilling. Noise of about ±15 per reading. It warms up: about 990 at the start, about 1130 after 2 to 3 hours. `0000` and `ffff` alternate in standby and during the ~50 s start-up of the effect: both mean "nothing measured", not "invalid" (experiments.md section 10). The bridge turns it into the Home Assistant sensor *Low water* (design.md section 5.6). | Plausible (two dry events: a test and a real run-out) |
 | 0x004d | 0x0002 | 3 B | R | `010000` / `010100` | Byte 2 is 1 while the flame effect is on ("effect active" flag) | Plausible |
@@ -86,7 +86,7 @@ All fields are plain binary numbers (not BCD). Example: 2026-10-14 19:45:04 = `1
 
 | Handle | UUID | Value | Note | Confidence |
 |---|---|---|---|---|
-| 0x0087 | 0x2001 | `000200` | Handshake register. The original remote writes `010200`, reads `010702`, writes `000000`, reads `000200`. Writing `010100` followed by `000000` is also accepted. The purpose is not known | Unknown |
+| 0x0087 (0x0085 on units with one characteristic less) | 0x2001 | `000200` | Handshake register. The original remote writes `010200`, reads `010702`, writes `000000`, reads `000200`. Writing `010100` followed by `000000` is also accepted. The purpose is not known | Unknown |
 | 0x0085 | 0x1050 | `4000160000000000` | constant | Unknown |
 | 0x0074 | 0x1050 | 8x `00` | constant | Unknown |
 
@@ -114,6 +114,8 @@ An unused slot is `00 00 00 00 0f 00` (00:00-00:00, 15 °C). Example: `06 1e 07 
 - **Not verified:** whether writing these registers changes the stored program, and how timer mode is switched on and off. The mode selection register (manual / timer / frost protection) has not been found.
 
 ## 7. Identification (read-only, constant)
+
+The bridge reads these registers by UUID after connecting and shows them on the Debug page (model, firmware, serial, `0x2009`, `0x200b`, and where the volume and handshake registers are), so units can be compared. A unit with the handles shifted by two (CAS400LNH) has the same UUIDs. Which of these values tell models apart is still open: add the values of other units here.
 
 | Handle | UUID | Value | Meaning | Confidence |
 |---|---|---|---|---|

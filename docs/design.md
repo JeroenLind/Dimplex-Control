@@ -76,8 +76,8 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | Finding the fireplace | Priority: (1) the address pinned in the settings, (2) the address remembered from an earlier auto-detect, (3) a 4 s active scan for a device whose name contains `Dimplex` (they advertise as `FI####<Dimplex>`). A found address is remembered in flash. In auto mode a failed connect clears the remembered address, so the next attempt scans again. |
 | Security | Legacy pairing with a fixed 6-digit passkey (default `064259` for the author's unit). The ESP32 declares keyboard and display capability and injects the configured passkey when the fireplace asks for it. No bonding is stored. Pairing takes place on every new connection. |
 | Connect procedure | Connect with a 5 s timeout, then secure the connection (pairing). The connection is "ready" once pairing succeeded and the registers were found. |
-| Registers | Addressed by raw GATT handle (the fireplace has no useful UUID names): `0x0040` control, `0x0014` heater, `0x0018` setpoint, `0x0048` heater power, `0x0042` flame level, `0x0055` temperature, `0x001e` setpoint limits, `0x0012` clock, `0x0087` handshake, `0x0076` volume, `0x003c` / `0x0063` diagnostics. Meaning and confidence of each: `register-map.md`. |
-| Handshake after connecting | Write the clock (`0x0012`) with the real local time, then write `0x0087` = `010100`, 120 ms later `000000`, as the remote does. If NTP has no time yet, the clock write is retried every 2 s. |
+| Registers | Addressed by raw GATT handle (the fireplace has no useful UUID names), except the registers whose handle differs between units: some units have one characteristic less, which shifts everything from `0x0074` on by 2. Those are found by UUID: volume (`0x4010`, handle `0x0076` or `0x0074`), handshake (`0x2001`, `0x0087` or `0x0085`) and the identification registers (see "Identification" below). `0x0040` control, `0x0014` heater, `0x0018` setpoint, `0x0048` heater power, `0x0042` flame level, `0x0055` temperature, `0x001e` setpoint limits, `0x0012` clock, `0x0087`/`0x0085` handshake, `0x0076`/`0x0074` volume, `0x003c` / `0x0063` diagnostics. Meaning and confidence of each: `register-map.md`. |
+| Handshake after connecting | Write the clock (`0x0012`) with the real local time, then write the handshake register (`0x0087`, or `0x0085`) = `010100`, 120 ms later `000000`, as the remote does. If NTP has no time yet, the clock write is retried every 2 s. |
 | Reading | `readFireplaceState()` reads the registers one by one. It runs every 5 s and after every command. |
 | Writing | One write per register, with response. The heater is started with two writes 650 ms apart (`0x0040`=`01`, then `0x0014`=`0200`), as the remote does. |
 | Confirmation | After a write the registers are read back until the fireplace reports the new state (first read after 250 ms, then every 300 ms, at most 3 to 4 s). The log shows `state confirmed after N ms` or `NOT confirmed`. |
@@ -105,6 +105,8 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | `dimplex/heater/set` | `ON` / `OFF` | Heater on (only works while the flame effect is on; MQTT does not start the effect itself) or off |
 | `dimplex/setpoint/set` | degrees, e.g. `21` | Setpoint, rounded and clamped to the limits. Mode "Fireplace thermostat": the fireplace's setpoint, only while the heater is on. Bridge modes: the bridge's own setpoint, at any time |
 | `dimplex/level/set` | `1` to `6` | Flame level |
+| `dimplex/volume/set` | `0` to `6` | Volume. Only subscribed to and acted on when the setting "My fireplace has sound" is on |
+| `dimplex/sound/set` | `ON` / `OFF` | Sound on (back to the last volume above 0, or 3) or off (volume 0). Same condition |
 | `dimplex/ble/set` | `ON` / `OFF` | `ON` = bridge holds the Bluetooth link; `OFF` = release it for the remote |
 | `dimplex/room_temperature/set` | degrees, e.g. `21.3` | Room temperature for the control mode "Room sensor (MQTT)". Plain number only; anything else is ignored. Publish without retain. Subscribed in every mode, only used in that mode |
 
@@ -118,6 +120,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | `dimplex/low_water/state` | `ON` / `OFF` | `ON` = the mist maker is dry (empty tank or lifted out of the water). Derived from register `0x003c` by `waterwatch.h` (section 5.6), retained. `OFF` while the flame effect is off, because nothing can be measured then |
 | `dimplex/setpoint/state` | degrees or `None` | Mode "Fireplace thermostat": `None` (unknown in Home Assistant) while the heater is off or before the first reading. Bridge modes: always the bridge setpoint |
 | `dimplex/level/state` | `1` to `6` | |
+| `dimplex/volume/state`, `dimplex/sound/state` | `0` to `6`, `ON`/`OFF` | Only published when "My fireplace has sound" is on |
 | `dimplex/heater_power/state` | `low` / `high` / `raw xx` | |
 | `dimplex/temperature/state` | e.g. `21.5` or `None` | Internal sensor, published only when it changed by at least 0.2 °C (deadband) |
 | `dimplex/control_mode/state` | text | Selected temperature control: `Fireplace thermostat`, `Room sensor (MQTT)`, `Internal sensor` (retained). Changed on the web page only |
@@ -146,7 +149,9 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | Raw registers | sensor (diagnostic) | `dimplex_raw` (`3c=`, `63=`, `51=`, `26=`, `36=`, `24=`) |
 | Last restart reason, Restart count, Uptime, Free memory, Lowest free memory, Wi-Fi signal, Wi-Fi drops, Last Wi-Fi outage, Bluetooth connections, MQTT connect failures, Free stack BLE task, Free stack MQTT task | sensors (diagnostic), all read from `dimplex/diag/state` | `dimplex_diag_restart_reason`, `dimplex_diag_restart_count`, `dimplex_diag_uptime`, `dimplex_diag_free_heap`, `dimplex_diag_min_heap`, `dimplex_diag_wifi`, `dimplex_diag_wifi_drops`, `dimplex_diag_wifi_outage`, `dimplex_diag_ble_connects`, `dimplex_diag_mqtt_failures`, `dimplex_diag_stack_ble`, `dimplex_diag_stack_mqtt` |
 
-Entities that existed in older versions (water sensor, volume, the read-only heater and setpoint sensors) are removed on connect by publishing an empty retained config.
+Entities that existed in older versions (water sensor, the read-only heater and setpoint sensors) are removed on connect by publishing an empty retained config. The same is done for Volume and Sound while the setting "My fireplace has sound" is off, and they are published when it is switched on (the discovery is repeated whenever the setting or the identification changes).
+
+**Device block.** The entities share one device. Once the identification has been read (section 5.1) the block carries the model (`Opti-myst (FI7539)`) and the firmware version (`sw`); before that it only says `Opti-myst`. Only keys that every Home Assistant version accepts are used.
 
 **Immediate echo.** A command takes about a second on the fireplace. Home Assistant switches flip back when the state topic does not change quickly. When a command arrives from MQTT, the expected state is published at once, and older values of the controlled entities are held back until the command has finished (or 8 s). If the command failed, the real state follows after the hold. Details: section 6.4.
 
@@ -157,7 +162,7 @@ Served by the Arduino `WebServer` on port 80 from `loop()`.
 | Path | Purpose |
 |---|---|
 | `/` | Main page: Bluetooth link, flame effect, heating, setpoint, thermostat status, room temperature (room sensor mode), internal temperature |
-| `/settings` | Settings page: flame level, heater power, temperature control mode with margins and time-out, volume, fireplace selection (scan, address, passkey), factory reset |
+| `/settings` | Settings page: flame level, heater power, temperature control mode with margins and time-out, sound setting and volume, fireplace selection (scan, address, passkey), factory reset |
 | `/debug` | Debug page: the registers that are not understood yet (`0x003c`, `0x0063`, and the watched `0x0051`, `0x0026`, `0x0036`, `0x0024`), temperature history, CSV download, system information, restart |
 | `/live?p=<page>` | Only the live block of a page (HTML fragment); polled by the page script |
 | `/set?...` | Actions. Parameters: `ctl=fireplace/room/internal` (temperature control mode), `xoff`, `xon`, `ioff`, `ion` (margins in degrees) with `tmo` (time-out in minutes), `ble=on/off`, `fx=on/off`, `heater=on/off`, `hpwr=low/high`, `sp=<deg>`, `spd=<+/-1>`, `flame=1..6`, `vol=0..6`, `scan=1`, `fpaddr=<mac or auto>`, `pkey=<digits>`, `diag=reset`, `restart=1`, `factory=confirm`, plus `r=<page>` for the page to return to |
@@ -211,6 +216,7 @@ Namespace `cfg`:
 | `bsetp` | Setpoint of the bridge's control (15 to 30) |
 | `xoff`, `xon`, `ioff`, `ion` | Margins in tenths of a degree: room sensor off / on, internal sensor off / on |
 | `tmo` | Room temperature time-out in minutes |
+| `sound` | "My fireplace has sound": offers Volume and Sound (web and Home Assistant). Default off |
 
 The Wi-Fi credentials are stored by WiFiManager itself. A factory reset clears this namespace (temperature control settings included) and the Wi-Fi credentials, then restarts into the setup portal.
 
@@ -285,7 +291,7 @@ Wi-Fi, lwIP and the NimBLE host run as system tasks, mostly on core 0.
 struct Command { CommandType type; int16_t argument; CommandSource source; };
 ```
 
-Command types: flame effect, heater, heater power, setpoint, setpoint delta (the +/- buttons), flame level, volume, Bluetooth release, Bluetooth resume, scan, apply settings, factory reset. Sending never blocks (`xQueueSend` with timeout 0); a full queue is reported as "Busy" and counted. The BLE task executes commands one at a time, in order. The +/- setpoint buttons send a delta that is applied to the value at execution time, so two quick clicks add up.
+Command types: flame effect, heater, heater power, setpoint, setpoint delta (the +/- buttons), flame level, volume, sound setting, Bluetooth release, Bluetooth resume, scan, apply settings, factory reset. Sending never blocks (`xQueueSend` with timeout 0); a full queue is reported as "Busy" and counted. The BLE task executes commands one at a time, in order. The +/- setpoint buttons send a delta that is applied to the value at execution time, so two quick clicks add up.
 
 **State** (BLE task to web and MQTT) goes through one `SharedState` structure under one mutex:
 - The BLE task keeps its own private variables. After every change (command, poll, link change) `publishSnapshot()` copies them into `g_shared` under the mutex and increments a version counter.
@@ -341,9 +347,11 @@ Limits: the ring only holds the last 30 lines (96 characters each), and nothing 
 ## 5. Component descriptions
 
 ### 5.1 BLE task
+**Identification.** Per connection the bridge reads the device name (`0x2a00`, shown without `<Dimplex>`, e.g. `FI7539`), firmware (`0x200a`), serial number (`0x200d`) and the two unknown fields `0x2009` and `0x200b`, plus the handles where it found the volume and handshake registers. They are shown on the Debug page and logged, so units can be compared; the model and firmware go into the Home Assistant device block. They are not used to decide features yet: the name is the same for the whole Pro Range family and the volume register exists on units without sound, so "has sound" is a setting (see section 7). Add the values of other units here when they are known.
+
 Loop, in this order:
 1. If Bluetooth is enabled, not connected and 5 s have passed since the last attempt: connect to the fireplace (may take seconds).
-2. If connected and paired, but not ready: find the registers, send the handshake, read the state, mark ready, tell the MQTT task to republish everything.
+2. If connected and paired, but not ready: find the registers (the volume and handshake registers and the identification registers by UUID; the identification is read once here and kept after a disconnect), send the handshake, read the state, mark ready, tell the MQTT task to republish everything.
 3. If ready and the clock was not set yet: retry the clock write every 2 s (needs NTP time).
 4. Wait up to 100 ms for a command; execute it, publish the snapshot. This wait is also the loop's yield.
 5. If ready and 5 s have passed: poll and publish the snapshot.
@@ -484,7 +492,7 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Polling instead of notifications | Reading every 5 s is simple and enough for temperature and remote changes. Whether the registers support notifications has not been investigated. |
 | Setpoint "unknown" while the heater is off | The fireplace only has a setpoint while the heater runs. Showing the last value is misleading. |
 | Temperature deadband of 0.2 °C | The sensor jumps by 0.1 to 0.3 °C without any change in conditions and the recorder filled up with noise. The Debug page, CSV and raw topic still show every reading. |
-| Volume only on the Settings page | Many models, including the author's, have no sound effect. The register is documented but kept out of MQTT and the CSV. |
+| Volume and Sound only with a setting | Many models, including the author's, have no sound effect, yet the volume register exists on every unit, so the bridge cannot tell. The user says whether the fireplace has sound (Settings page, default no); only then are Volume and Sound shown and offered to Home Assistant. The identification (model, firmware, serial) is read and shown to find out later whether the model can decide this by itself. |
 | Buttons show "waiting" until confirmed | A command takes about a second. Without feedback it looks as if nothing happened. |
 | Timestamps through one helper | A mix of timestamped and plain lines made the log hard to read. |
 | Settings in NVS, set up through a captive portal | No credentials in the source needed for normal use, and no re-flash to change the broker or fireplace. |

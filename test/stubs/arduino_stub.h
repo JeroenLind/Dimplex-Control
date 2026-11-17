@@ -148,6 +148,8 @@ class Preferences {
   uint32_t getUInt(const char *k, uint32_t d = 0) { auto &m = store()[ns_]; return m.count(k) ? (uint32_t) strtoul(m[k].c_str(), nullptr, 10) : d; }
   size_t putUInt(const char *k, uint32_t v) { store()[ns_][k] = std::to_string(v); return 4; }
   bool has(const char *k) { return store()[ns_].count(k) > 0; }
+  bool getBool(const char *k, bool d = false) { auto &m = store()[ns_]; return m.count(k) ? m[k] != "0" : d; }
+  size_t putBool(const char *k, bool v) { store()[ns_][k] = v ? "1" : "0"; return 1; }
 };
 
 // ---- WiFiManager ----
@@ -213,9 +215,11 @@ struct FireplaceSim {
   void write(int handle, const uint8_t *data, size_t n);
 };
 extern FireplaceSim g_sim;
+struct NimBLEUUID { uint16_t v; NimBLEUUID(uint16_t x = 0) : v(x) {} bool operator==(const NimBLEUUID &o) const { return v == o.v; } };
 struct NimBLERemoteCharacteristic {
-  int handle;
-  explicit NimBLERemoteCharacteristic(int h) : handle(h) {}
+  int handle; uint16_t uuid = 0;
+  NimBLERemoteCharacteristic(int h, uint16_t u = 0) : handle(h), uuid(u) {}
+  NimBLEUUID getUUID() const { return NimBLEUUID(uuid); }
   int getHandle() const { return handle; }
   NimBLEAttValue readValue() { NimBLEAttValue v; v.d = g_sim.regs[handle]; return v; }
   bool writeValue(const uint8_t *data, size_t n, bool) { g_sim.write(handle, data, n); return true; }
