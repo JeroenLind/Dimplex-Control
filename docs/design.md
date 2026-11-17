@@ -161,8 +161,8 @@ Served by the Arduino `WebServer` on port 80 from `loop()`.
 
 | Path | Purpose |
 |---|---|
-| `/` | Main page: Bluetooth link, flame effect, heating, setpoint, thermostat status, room temperature (room sensor mode), internal temperature |
-| `/settings` | Settings page: flame level, heater power, temperature control mode with margins and time-out, sound setting and volume, fireplace selection (scan, address, passkey), factory reset |
+| `/` | Main page: Bluetooth link, flame effect, volume (only with the sound setting), heating, setpoint, thermostat status, room temperature (room sensor mode), internal temperature |
+| `/settings` | Settings page: flame level, heater power, temperature control mode with margins and time-out, "My fireplace has sound" setting, fireplace selection (scan, address, passkey), factory reset |
 | `/debug` | Debug page: the registers that are not understood yet (`0x003c`, `0x0063`, and the watched `0x0051`, `0x0026`, `0x0036`, `0x0024`), temperature history, CSV download, system information, restart |
 | `/live?p=<page>` | Only the live block of a page (HTML fragment); polled by the page script |
 | `/set?...` | Actions. Parameters: `ctl=fireplace/room/internal` (temperature control mode), `xoff`, `xon`, `ioff`, `ion` (margins in degrees) with `tmo` (time-out in minutes), `ble=on/off`, `fx=on/off`, `heater=on/off`, `hpwr=low/high`, `sp=<deg>`, `spd=<+/-1>`, `flame=1..6`, `vol=0..6`, `scan=1`, `fpaddr=<mac or auto>`, `pkey=<digits>`, `diag=reset`, `restart=1`, `factory=confirm`, plus `r=<page>` for the page to return to |
@@ -492,7 +492,7 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Polling instead of notifications | Reading every 5 s is simple and enough for temperature and remote changes. Whether the registers support notifications has not been investigated. |
 | Setpoint "unknown" while the heater is off | The fireplace only has a setpoint while the heater runs. Showing the last value is misleading. |
 | Temperature deadband of 0.2 °C | The sensor jumps by 0.1 to 0.3 °C without any change in conditions and the recorder filled up with noise. The Debug page, CSV and raw topic still show every reading. |
-| Volume and Sound only with a setting | Many models, including the author's, have no sound effect, yet the volume register exists on every unit, so the bridge cannot tell. The user says whether the fireplace has sound (Settings page, default no); only then are Volume and Sound shown and offered to Home Assistant. The identification (model, firmware, serial) is read and shown to find out later whether the model can decide this by itself. |
+| Volume and Sound only with a setting | Many models, including the author's, have no sound effect, yet the volume register exists on every unit, so the bridge cannot tell. The user says whether the fireplace has sound (Settings page, default no); only then are Volume (on the Main page) and Sound shown and offered to Home Assistant. The identification (model, firmware, serial) is read and shown to find out later whether the model can decide this by itself. |
 | Buttons show "waiting" until confirmed | A command takes about a second. Without feedback it looks as if nothing happened. |
 | Timestamps through one helper | A mix of timestamped and plain lines made the log hard to read. |
 | Settings in NVS, set up through a captive portal | No credentials in the source needed for normal use, and no re-flash to change the broker or fireplace. |

@@ -51,8 +51,10 @@ int main() {
   g_hasSound = false; onMqttMessage(t1, p1, 1); CK(!xQueueReceive(g_commandQueue, &c, 0));
   // Pages
   g_hasSound = true; publishSnapshot();
-  handleSettingsPage(); CK(g_webServer.lastBody.find("My fireplace has a sound effect") != std::string::npos && g_webServer.lastBody.find("<h3>Volume</h3>") != std::string::npos);
-  g_hasSound = false; publishSnapshot(); handleSettingsPage(); CK(g_webServer.lastBody.find("<h3>Volume</h3>") == std::string::npos);
+  handleSettingsPage(); CK(g_webServer.lastBody.find("My fireplace has a sound effect") != std::string::npos && g_webServer.lastBody.find("<h3>Volume</h3>") == std::string::npos);   // the volume is not on Settings
+  handleMainPage(); CK(g_webServer.lastBody.find("<h3>Volume</h3>") != std::string::npos);                       // but on the Main page
+  g_hasSound = false; publishSnapshot(); handleMainPage(); CK(g_webServer.lastBody.find("<h3>Volume</h3>") == std::string::npos);
+  handleSettingsPage(); CK(g_webServer.lastBody.find("My fireplace has a sound effect") != std::string::npos);   // the setting itself is always there
   handleDebugPage(); CK(g_webServer.lastBody.find("EP4120") != std::string::npos && g_webServer.lastBody.find("F000B5E0") != std::string::npos && g_webServer.lastBody.find("0x76 / 0x87") != std::string::npos);
   printf("model test: %d failed\n", fails); return fails;
 }

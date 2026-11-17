@@ -1780,6 +1780,8 @@ static String buildMainLive(const SharedState &s) {
 
   h += "<h3>Flame effect</h3>" + choiceButton("On", setHref("fx=on"), effectOn, AW_EFFECT, 1) + choiceButton("Off (all off)", setHref("fx=off"), ready && !effectOn, AW_EFFECT, 0);
 
+  if (s.hasSound) h += "<h3>Volume</h3>" + linkButtonRow("vol", AW_VOLUME, ready ? s.volume : -1, 0, 6);     // only for fireplaces with a sound effect (Settings page)
+
   h += "<h3>Heating</h3>" + choiceButton("On", setHref("heater=on"), heaterOn, AW_HEATER, 1) + choiceButton("Off", setHref("heater=off"), ready && !heaterOn, AW_HEATER, 0);
   h += bridgeControl ? buildThermostatStatus(s) : String("<p class=dim>Heating On switches the flame effect on first when it is off. Without the flame effect the fireplace cannot heat.</p>");
 
@@ -1827,8 +1829,8 @@ static String buildSettingsLive(const SharedState &s) {
 
 
   h += "<h3>Sound</h3><p class=dim>My fireplace has a sound effect: " + linkButton("Yes", setHref("sound=on"), s.hasSound) + linkButton("No", setHref("sound=off"), !s.hasSound) +
-       "<br>The register for the volume exists on every model, also on those without sound, so the bridge cannot see this by itself. Only when this is Yes the volume is shown here and Volume and Sound are offered to Home Assistant.</p>";
-  if (s.hasSound) h += "<h3>Volume</h3>" + linkButtonRow("vol", AW_VOLUME, ready ? s.volume : -1, 0, 6);
+       "<br>The register for the volume exists on every model, also on those without sound, so the bridge cannot see this by itself. Only when this is Yes the volume is shown on the Main page and Volume and Sound are offered to Home Assistant.</p>";
+
 
   h += "<h3>Fireplace</h3><p class=dim>Selected: <b>" + String(s.configuredAddress[0] ? s.configuredAddress : "auto-detect") + "</b> &middot; passkey " + htmlEscape(s.passkeyText);
   h += "<br>Connected to: " + String(s.ready ? s.targetAddress : "(not connected)") + "</p>";
