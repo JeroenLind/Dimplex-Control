@@ -29,6 +29,32 @@ Dimplex Control is an ESP32 bridge for a **Dimplex Opti-myst electric fireplace*
 4. Be configurable without re-flashing (Wi-Fi, MQTT broker, fireplace address and passkey).
 5. Coexist with the original remote: the Bluetooth link can be released on demand.
 6. Be easy to follow and change: one sketch file with clear sections, English names and comments.
+7. Run a **weekly program** in the bridge itself (planned, see "Requirements: weekly program" below).
+
+### Requirements: weekly program (planned, not implemented yet)
+
+The fireplace's own weekly timer is not used: it stops working after a manual operation. The bridge keeps its own program, independent of Home Assistant. The requirements below were agreed with the owner.
+
+| # | Requirement |
+|---|---|
+| P1 | The program is a **list of rules**. Each rule has a set of weekdays, an **on time** and an **off time**. The user adds and removes rules himself; there is no fixed list of options. The list holds at least **20 rules**. |
+| P2 | **On** means: flame effect on and heating on, using the current settings (temperature control mode, heater power, setpoint). |
+| P3 | **Off** means: everything off (standby). |
+| P4 | A rule may **cross midnight** (for example on 22:00, off 01:00 the next day). |
+| P5 | Every program moment is **always executed**, whatever the state of the fireplace and whatever was done by hand in between. Manual operation stays in force until the next program moment, which then takes over again. |
+| P6 | If the fireplace cannot be reached at a program moment (remote has the link, out of range), the bridge **retries for 5 minutes** and then gives up and logs it. |
+| P7 | After a restart or power loss (or while NTP time is not known yet), missed moments are **not** caught up. The program waits for the next moment. |
+| P8 | The rules and the on/off state of the program as a whole are **stored in flash** and survive a restart. |
+| P9 | The program is managed on its own web page **Program** (list, add, remove). |
+| P10 | The program as a whole can be switched on and off, and its state is visible, over MQTT/Home Assistant (a switch). Editing the rules over MQTT is not required. |
+| P11 | No extra safety measures: the bridge executes what is in the list (no maximum run time, no check on Low water). The fireplace's own timer is left alone. |
+
+Open points still to be decided with the owner (nothing is assumed for these):
+
+- Time zone and daylight saving time: the bridge currently has the time zone only in the source/portal. Which zone applies, and should it become a setting?
+- Rules that overlap, or an on time equal to the off time.
+- Whether a single rule can be switched off without deleting it.
+- What happens at the web page when the time is not synchronised yet.
 
 ### Non-goals
 - No cloud connection. Everything stays on the local network.
