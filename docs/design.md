@@ -244,6 +244,7 @@ Namespace `cfg`:
 | `xoff`, `xon`, `ioff`, `ion` | Margins in tenths of a degree: room sensor off / on, internal sensor off / on |
 | `tmo` | Room temperature time-out in minutes |
 | `sound` | "My fireplace has sound": offers Volume and Sound (web and Home Assistant). Default off |
+| `prog_rules` (blob), `prog_on`, `tz` | Weekly program (planned): the rules, the on/off state of the program as a whole, the time zone as POSIX TZ string (section 5.7) |
 
 The Wi-Fi credentials are stored by WiFiManager itself. A factory reset clears this namespace (temperature control settings included) and the Wi-Fi credentials, then restarts into the setup portal.
 
@@ -427,6 +428,33 @@ Register `0x003c` reads about 1000 to 1100 with the mist maker under water and 3
 - **Reset:** the state is cleared when the Bluetooth link goes down.
 - **No action:** the bridge only reports. The fireplace switches the flame effect off itself when it is dry; the heater is not touched by this detection.
 - **Web page:** a red notice on the Main page while low water is on; the Debug page shows the state next to register `0x003c`.
+
+### 5.7 Weekly program (planned, design)
+Implements requirements P1 to P15. Same split as the thermostat: the decisions are in a plain C++ header (`schedule.h`, tested on a PC in `test/schedule_test.cpp`), the switching reuses the existing commands.
+
+**Rules.** `ScheduleRule { uint8_t days; uint16_t onMinute; uint16_t offMinute; bool enabled; }`: `days` is a bit mask (bit 0 Monday to bit 6 Sunday), times are minutes since midnight (0 to 1439). At most `SCHEDULE_MAX_RULES = 20` rules (P1). A rule whose off time is not later than its on time crosses midnight: it is on from the on time until the off time of the *next* day (P4). Stored as a blob of 20 x 6 bytes plus a count in NVS (`prog_rules`), written on every change (P8).
+
+**Validation (P13).** Each rule is expanded to intervals on a week of 10080 minutes (wrapping from Sunday to Monday). A rule is refused when its on time equals its off time, when it has no day, or when one of its intervals overlaps or touches an interval of another rule. Touching (off 18:00, on 18:00) counts as a conflict, because both moments would fall in the same minute. Disabled rules (P14) are checked too, so that enabling one later cannot create a conflict.
+
+**Deciding what is due.** `scheduleDue()` gets the rules, the local time as weekday, minute of day and a *minute key* (local date and minute) and returns *on*, *off* or nothing. A moment is due in the minute where a rule's on time (on one of its days) or off time (on the day after one of its days when it crosses midnight, otherwise on the same day) matches. Every minute key is handled once; the scheduler remembers the last key it handled. If `loop()` was held up for a few minutes the missed minutes are handled in order, with the last one winning. The very first call after a restart, or after the time becomes known, only stores the key: nothing is caught up (P7). Local time makes daylight saving behave as on a wall clock: a moment in the hour that is skipped in spring does not happen, a moment in the hour that is repeated in autumn is executed once, because the key is remembered.
+
+**Executing.** The scheduler runs in `loop()` once a second, and only when the program is switched on and the time is known. It does not read the fireplace state to decide: a due moment always gives a command (P5), so manual operation in between has no influence on later moments. On = the existing one-press heating command (`CMD_HEATER` with argument 2: flame effect first, then the heater, with the current mode, setpoint and power). Off = `CMD_FLAME_EFFECT` with argument 0, which also clears the heating wish (everything off, P3). Commands get `SOURCE_SCHEDULE` so that the log shows them, and they go through the same queue, so `bleTask` stays the only owner of Bluetooth.
+
+**Retry (P6).** After queuing, the scheduler keeps the action as *pending* with a deadline of 5 minutes. Every 30 seconds it checks the snapshot: on is done when the flame effect is on and the heating wish is set, off is done when the flame effect is off. If not done, the command is queued again. At the deadline it gives up and logs `program: gave up`. A newer moment replaces a pending action. While the link is released for the remote, the commands fail and are retried until the deadline; the program never takes the link back by itself.
+
+**Time zone (P12).** The POSIX TZ string (`tz` in NVS, default `CET-1CEST,M3.5.0,M10.5.0/3`) replaces the fixed string in `loop()`. The Settings page has a drop-down with common zones and a text field for another TZ string; applying it calls `setenv("TZ")` and `tzset()` without a restart. The fireplace clock (`writeFireplaceClock`) follows the same zone.
+
+**Web page `/program` (P9, P14, P15).** A fourth page in the menu: a notice when the time is not known, a switch for the program as a whole, a table of rules (days, on, off, enabled checkbox, delete button) and a form to add a rule (weekday checkboxes and two time fields). The page is plain forms (`/program/add`, `/program/delete`, `/program/toggle`, `/program/enable`), like the Settings page; a refused rule shows the reason. Because the list is changed from `loop()` only, no extra locking is needed; the scheduler and the pages run in the same task.
+
+**MQTT (P10).** Switch `dimplex/program/set` (`ON`/`OFF`) with retained state `dimplex/program/state`, discovered as a switch entity `program` in the same device. Rules are not exposed over MQTT.
+
+**Decisions made in this design that you can still change:**
+- Touching intervals (off time of one rule equals the on time of another) are refused, not allowed.
+- The time zone is entered as a drop-down plus a free TZ string, applied without a restart.
+- On a due moment the scheduler does not take back a released Bluetooth link; it retries until the deadline.
+- Retry uses the snapshot (effect on and heating wish set) as proof of success.
+
+**Tests.** `schedule_test.cpp`: validation (overlap, touching, midnight crossing, week wrap, no day), due moments per weekday, midnight crossing, no catch-up at the first call, several missed minutes, daylight saving (skipped and repeated hour), dedupe within a minute.
 
 ---
 
