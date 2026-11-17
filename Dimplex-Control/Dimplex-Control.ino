@@ -129,7 +129,8 @@ static const char *TOPIC_SETPOINT_SET       = "dimplex/setpoint/set";       // d
 static const char *TOPIC_SETPOINT_STATE     = "dimplex/setpoint/state";     // 0x0018, non-zero only while the heater is on
 static const char *TOPIC_BLE_SET            = "dimplex/ble/set";            // ON = bridge connects to the fireplace, OFF = release the link (remote can connect)
 static const char *TOPIC_BLE_STATE          = "dimplex/ble/state";          // ON/OFF: whether the bridge is allowed to hold the BLE link
-static const char *TOPIC_HEATER_POWER_STATE = "dimplex/heater_power/state"; // low/high (0x0048: 01 = 0.9 kW, 03 = 1.8 kW)
+static const char *TOPIC_HEATER_POWER_STATE = "dimplex/heater_power/state"; // low/high (0x0048: 01 = 0.9 kW, 03 = 1.8 kW); `None` for any other value
+static const char *TOPIC_HEATER_POWER_SET   = "dimplex/heater_power/set";   // low / high (any case)
 static const char *TOPIC_TEMPERATURE_STATE  = "dimplex/temperature/state";  // 0x0055: byte1 = degrees, byte2 = tenths
 static const char *TOPIC_LOW_WATER_STATE    = "dimplex/low_water/state";    // ON = the mist maker is dry (empty tank), derived from 0x003c (waterwatch.h)
 static const char *TOPIC_RAW_STATE          = "dimplex/raw/state";          // diagnostics: raw bytes of the interesting registers
@@ -1393,6 +1394,7 @@ static void publishHomeAssistantDiscovery() {
   removeEntity("binary_sensor", "water");
   removeEntity("binary_sensor", "heater");     // replaced by the heater switch
   removeEntity("sensor", "setpoint");          // replaced by the setpoint number
+  removeEntity("sensor", "heater_power");      // replaced by the heater power select
   // ---- controls ----
   publishEntity("switch", "power", String("\"name\":\"Fireplace\",\"uniq_id\":\"dimplex_power\",\"cmd_t\":\"") + TOPIC_POWER_SET +
                 "\",\"stat_t\":\"" + TOPIC_POWER_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ic\":\"mdi:fireplace\"" + avail);
@@ -1409,6 +1411,8 @@ static void publishHomeAssistantDiscovery() {
   publishEntity("number", "setpoint_number", String("\"name\":\"Setpoint\",\"uniq_id\":\"dimplex_setpoint_number\",\"cmd_t\":\"") + TOPIC_SETPOINT_SET +
                 "\",\"stat_t\":\"" + TOPIC_SETPOINT_STATE + "\",\"min\":15,\"max\":30,\"step\":1,\"mode\":\"box\",\"unit_of_meas\":\"°C\","
                 "\"dev_cla\":\"temperature\",\"ic\":\"mdi:thermometer-check\"" + avail);
+  publishEntity("select", "heater_power", String("\"name\":\"Heater power\",\"uniq_id\":\"dimplex_heater_power_select\",\"cmd_t\":\"") + TOPIC_HEATER_POWER_SET +
+                "\",\"stat_t\":\"" + TOPIC_HEATER_POWER_STATE + "\",\"options\":[\"low\",\"high\"],\"ic\":\"mdi:flash\"" + avail);
   publishEntity("switch", "ble", String("\"name\":\"Bluetooth link\",\"uniq_id\":\"dimplex_ble_link\",\"cmd_t\":\"") + TOPIC_BLE_SET +
                 "\",\"stat_t\":\"" + TOPIC_BLE_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ent_cat\":\"config\",\"ic\":\"mdi:bluetooth\"" + avail);
   // ---- read-only ----
@@ -1418,8 +1422,6 @@ static void publishHomeAssistantDiscovery() {
                 "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"dev_cla\":\"heat\",\"ic\":\"mdi:radiator\"" + avail);
   publishEntity("binary_sensor", "low_water", String("\"name\":\"Low water\",\"uniq_id\":\"dimplex_low_water\",\"stat_t\":\"") + TOPIC_LOW_WATER_STATE +
                 "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"dev_cla\":\"problem\",\"ic\":\"mdi:water-alert\"" + avail);
-  publishEntity("sensor", "heater_power", String("\"name\":\"Heater power\",\"uniq_id\":\"dimplex_heater_power\",\"stat_t\":\"") + TOPIC_HEATER_POWER_STATE +
-                "\",\"ic\":\"mdi:flash\"" + avail);
   publishEntity("sensor", "temperature", String("\"name\":\"Internal temperature\",\"uniq_id\":\"dimplex_temperature\",\"stat_t\":\"") + TOPIC_TEMPERATURE_STATE +
                 "\",\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\",\"stat_cla\":\"measurement\"" + avail);
   publishEntity("sensor", "control_mode", String("\"name\":\"Temperature control\",\"uniq_id\":\"dimplex_control_mode\",\"stat_t\":\"") + TOPIC_CONTROL_MODE_STATE +
@@ -1439,6 +1441,10 @@ static void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   if (!strcmp(topic, TOPIC_POWER_SET))           queueMqttCommand(CMD_FLAME_EFFECT, isOn ? 1 : 0);                  // flame effect on/off
   else if (!strcmp(topic, TOPIC_BLE_SET))        queueMqttCommand(isOn ? CMD_BLE_RESUME : CMD_BLE_RELEASE, 0);         // Bluetooth link on/off
   else if (!strcmp(topic, TOPIC_HEATER_SET))     queueMqttCommand(CMD_HEATER, isOn ? 1 : 0);                        // heater on/off
+  else if (!strcmp(topic, TOPIC_HEATER_POWER_SET)) {                                                                // heater power low/high (not echoed: the state follows the read-back)
+    if (!strcasecmp(text, "low") || !strcasecmp(text, "high")) queueMqttCommand(CMD_HEATER_POWER, strcasecmp(text, "high") == 0 ? 1 : 0);
+    else logLine("mqtt", "ignored heater power '%s' (use low or high)", text);
+  }
   else if (!strcmp(topic, TOPIC_SETPOINT_SET))   queueMqttCommand(CMD_SETPOINT, (int)(atof(text) + 0.5));          // the BLE side clamps to the limits
   else if (!strcmp(topic, TOPIC_ROOM_TEMPERATURE_SET)) {                                                           // room temperature for the control mode "room sensor"
     int tenths;
@@ -1488,7 +1494,7 @@ static bool tryMqttConnect() {
     g_mqttClient.publish(TOPIC_AVAILABILITY, "online", true);
     g_mqttClient.subscribe(TOPIC_POWER_SET); g_mqttClient.subscribe(TOPIC_FLAME_LEVEL_SET);
     g_mqttClient.subscribe(TOPIC_HEATER_SET); g_mqttClient.subscribe(TOPIC_SETPOINT_SET); g_mqttClient.subscribe(TOPIC_BLE_SET);
-    g_mqttClient.subscribe(TOPIC_ROOM_TEMPERATURE_SET);
+    g_mqttClient.subscribe(TOPIC_ROOM_TEMPERATURE_SET); g_mqttClient.subscribe(TOPIC_HEATER_POWER_SET);
     g_mqttClient.subscribe(TOPIC_VOLUME_SET); g_mqttClient.subscribe(TOPIC_SOUND_SET);
     buildDeviceBlock(g_mqttSnapshot.ident); g_publishedIdentKey = identKeyOf(g_mqttSnapshot);
     publishHomeAssistantDiscovery();
@@ -1550,7 +1556,7 @@ static void publishChanges(const SharedState &s) {
   if ((int) s.lowWater != g_publishedLowWater) { g_mqttClient.publish(TOPIC_LOW_WATER_STATE, s.lowWater ? "ON" : "OFF", true); g_publishedLowWater = s.lowWater; logLine("pub", "low water=%d", s.lowWater); }
   int powerCode = (s.regHeaterPower == 0x01) ? 0 : (s.regHeaterPower == 0x03 ? 1 : 2);
   if (powerCode != g_publishedHeaterPower) {
-    char text[12]; if (powerCode == 2) snprintf(text, sizeof(text), "raw %02x", s.regHeaterPower); else snprintf(text, sizeof(text), "%s", powerCode ? "high" : "low");
+    const char *text = powerCode == 2 ? "None" : (powerCode ? "high" : "low");       // `None` = unknown to Home Assistant (the Debug page shows the raw value)
     g_mqttClient.publish(TOPIC_HEATER_POWER_STATE, text, true); g_publishedHeaterPower = powerCode;
   }
   if (!hold && !bridgeControl) {                             // (with bridge control the setpoint was published above)

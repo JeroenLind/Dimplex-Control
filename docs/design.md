@@ -107,6 +107,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | `dimplex/level/set` | `1` to `6` | Flame level |
 | `dimplex/volume/set` | `0` to `6` | Volume. Only subscribed to and acted on when the setting "My fireplace has sound" is on |
 | `dimplex/sound/set` | `ON` / `OFF` | Sound on (back to the last volume above 0, or 3) or off (volume 0). Same condition |
+| `dimplex/heater_power/set` | `low` / `high` (any case) | Heater power 0.9 / 1.8 kW. Anything else is ignored and logged. Works with the heater off too. Not echoed: the state follows the read-back from the fireplace |
 | `dimplex/ble/set` | `ON` / `OFF` | `ON` = bridge holds the Bluetooth link; `OFF` = release it for the remote |
 | `dimplex/room_temperature/set` | degrees, e.g. `21.3` | Room temperature for the control mode "Room sensor (MQTT)". Plain number only; anything else is ignored. Publish without retain. Subscribed in every mode, only used in that mode |
 
@@ -121,7 +122,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | `dimplex/setpoint/state` | degrees or `None` | Mode "Fireplace thermostat": `None` (unknown in Home Assistant) while the heater is off or before the first reading. Bridge modes: always the bridge setpoint |
 | `dimplex/level/state` | `1` to `6` | |
 | `dimplex/volume/state`, `dimplex/sound/state` | `0` to `6`, `ON`/`OFF` | Only published when "My fireplace has sound" is on |
-| `dimplex/heater_power/state` | `low` / `high` / `raw xx` | |
+| `dimplex/heater_power/state` | `low` / `high` / `None` | `None` (unknown to Home Assistant) for any other value of register `0x0048`; the Debug page shows the raw value |
 | `dimplex/temperature/state` | e.g. `21.5` or `None` | Internal sensor, published only when it changed by at least 0.2 °C (deadband) |
 | `dimplex/control_mode/state` | text | Selected temperature control: `Fireplace thermostat`, `Room sensor (MQTT)`, `Internal sensor` (retained). Changed on the web page only |
 | `dimplex/thermostat/state` | text | `heating`, `target reached`, `no room temperature`, `off`, `not used` (retained) |
@@ -142,7 +143,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | Flame intensity | number (1 to 6) | `dimplex_level` |
 | Bluetooth link | switch (config) | `dimplex_ble_link` |
 | Flame intensity state | sensor | `dimplex_levelstate` |
-| Heater power | sensor | `dimplex_heater_power` |
+| Heater power | select (low, high) | `dimplex_heater_power_select` (was a sensor, `dimplex_heater_power`; the old discovery is removed) |
 | Internal temperature | sensor | `dimplex_temperature` |
 | Temperature control | sensor | `dimplex_control_mode` |
 | Thermostat status | sensor | `dimplex_thermostat` |
