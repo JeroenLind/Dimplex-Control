@@ -151,7 +151,7 @@ static bool g_webStarted = false;
 
 enum CommandType : uint8_t { CMD_FLAME_EFFECT, CMD_HEATER, CMD_HEATER_POWER, CMD_SETPOINT, CMD_SETPOINT_DELTA,
                              CMD_FLAME_LEVEL, CMD_VOLUME, CMD_BLE_RELEASE, CMD_BLE_RESUME,
-                             CMD_SCAN, CMD_APPLY_SETTINGS, CMD_FACTORY_RESET, CMD_CONTROL_MODE, CMD_APPLY_THERMOSTAT };
+                             CMD_SCAN, CMD_APPLY_SETTINGS, CMD_FACTORY_RESET, CMD_CONTROL_MODE, CMD_APPLY_THERMOSTAT, CMD_SET_HAS_SOUND };
 enum CommandSource : uint8_t { SOURCE_WEB = 0, SOURCE_MQTT = 1 };
 struct Command { CommandType type; int16_t argument; CommandSource source; };
 static QueueHandle_t g_commandQueue = nullptr;
@@ -172,11 +172,20 @@ struct StatusSample {                       // one row of the temperature table 
 struct ScanEntry { char name[28]; char address[20]; int rssi; };   // one fireplace found by a BLE scan
 #define SCAN_MAX 8
 // Everything the web page and MQTT need. Plain data only (memcpy-able), no String.
+// What the fireplace says about itself (read-only registers, read once per connection): see docs/register-map.md section 7.
+struct FireplaceIdent {
+  bool known;
+  char name[24], firmware[12], serial[12];     // model name (device name without "<Dimplex>"), firmware version, serial number
+  uint8_t hardware, reg200b[2];                // 0x2009 (hardware revision?) and 0x200b (unknown), kept to compare units
+  uint16_t volumeHandle, initHandle;           // where this unit has the volume and handshake registers (they differ between units)
+};
 struct SharedState {
   bool valid, connected, ready, bleEnabled, haveTarget;
   uint8_t regControl[2], regHeater[2], regHeaterPower, flameLevel, volume, regTemperature[3], regUnknown3c[3], regUnknown63[2];
   uint8_t regExtra51[2], regExtra26, regExtra36[2], regExtra24;   // registers we only watch (not understood yet)
   bool lowWater;                             // the mist maker is dry (waterwatch.h)
+  FireplaceIdent ident;                      // model, firmware, serial (kept after a disconnect)
+  bool hasSound;                             // setting: this fireplace has a sound effect (Volume and Sound are offered)
   int setpoint, setpointMin, setpointMax;
   // temperature control in the bridge (thermostat.h)
   uint8_t controlMode, thermostatState;      // ControlMode, ThermostatState
@@ -412,6 +421,8 @@ static uint8_t g_regControl[2] = {0, 0}, g_regHeater[2] = {0, 0}, g_regHeaterPow
 static uint8_t g_regTemperature[3] = {0, 0, 0}, g_regUnknown3c[3] = {0, 0, 0}, g_regUnknown63[2] = {0, 0};
 static uint8_t g_regExtra51[2] = {0, 0}, g_regExtra26 = 0, g_regExtra36[2] = {0, 0}, g_regExtra24 = 0;   // watched only: 0x0051, 0x0026, 0x0036, 0x0024
 static uint8_t g_flameLevel = 0, g_volume = 0;
+static FireplaceIdent g_ident = {};               // written by bleTask
+static volatile bool g_hasSound = false;          // flash key "sound": Volume and Sound are only offered when this is set (default off)
 static WaterWatch g_waterWatch = {};            // low water detection on 0x003c (bleTask only)
 static int g_setpoint = 0;                      // 0x0018 (0 while the heater is off)
 static int g_setpointMin = 15, g_setpointMax = 30;   // replaced by the limits read from 0x001e
@@ -458,7 +469,7 @@ static void publishSnapshot() {
   memcpy(s.regControl, g_regControl, 2); memcpy(s.regHeater, g_regHeater, 2); memcpy(s.regTemperature, g_regTemperature, 3);
   memcpy(s.regUnknown3c, g_regUnknown3c, 3); memcpy(s.regUnknown63, g_regUnknown63, 2);
   memcpy(s.regExtra51, g_regExtra51, 2); s.regExtra26 = g_regExtra26; memcpy(s.regExtra36, g_regExtra36, 2); s.regExtra24 = g_regExtra24; s.lowWater = g_waterWatch.lowWater;
-  s.regHeaterPower = g_regHeaterPower; s.flameLevel = g_flameLevel; s.volume = g_volume; s.setpoint = g_setpoint;
+  s.regHeaterPower = g_regHeaterPower; s.flameLevel = g_flameLevel; s.volume = g_volume; s.ident = g_ident; s.hasSound = g_hasSound; s.setpoint = g_setpoint;
   strlcpy(s.configuredAddress, cfg_fireplaceAddress, sizeof(s.configuredAddress)); strlcpy(s.passkeyText, cfg_passkeyText, sizeof(s.passkeyText));
   memcpy(s.scan, g_scanEntries, sizeof(g_scanEntries)); s.scanCount = g_scanCount; s.scanning = g_scanning; s.scanFinishedMs = g_scanFinishedMs;
   s.setpointMin = g_setpointMin; s.setpointMax = g_setpointMax; s.lastReadMs = g_lastReadMs;
@@ -492,6 +503,7 @@ static void loadSettings() {
   strlcpy(cfg_passkeyText, g_prefs.getString("pkey", cfg_passkeyText).c_str(), sizeof(cfg_passkeyText));
   strlcpy(g_detectedAddress, g_prefs.getString("detaddr", "").c_str(), sizeof(g_detectedAddress));
   // temperature control: mode, bridge setpoint, margins and time-out (values that are missing or out of range keep the defaults)
+  g_hasSound = g_prefs.getBool("sound", false);
   uint8_t mode = g_prefs.getUChar("ctlmode", CONTROL_FIREPLACE);
   g_controlMode = mode <= CONTROL_INTERNAL ? (ControlMode) mode : CONTROL_FIREPLACE;
   int setpoint = g_prefs.getUChar("bsetp", 21);
@@ -569,7 +581,26 @@ class FireplaceClientCallbacks : public NimBLEClientCallbacks {
 
 // Find the characteristics we use by their raw handle (the fireplace has no useful UUID names).
 // Returns true when at least the control register 0x0040 exists.
+// Copy printable text out of a register value (stops at a zero byte).
+static void textFromBytes(char *dst, size_t size, const uint8_t *src, size_t length) {
+  size_t j = 0;
+  for (size_t i = 0; i < length && j + 1 < size && src[i]; i++) dst[j++] = (src[i] >= 32 && src[i] < 127) ? (char) src[i] : '?';
+  dst[j] = 0;
+}
+static size_t readRegister(NimBLERemoteCharacteristic *characteristic, uint8_t *out, size_t maxLength);   // defined below
+// Identification registers, found by UUID (read-only and constant). Called for every characteristic while they are listed.
+static void readIdentity(NimBLERemoteCharacteristic *c) {
+  uint8_t b[24]; size_t n;
+  if (c->getUUID() == NimBLEUUID((uint16_t) 0x2a00)) {                      // device name, e.g. "FI7539<Dimplex>": keep the part before "<"
+    n = readRegister(c, b, sizeof(b)); textFromBytes(g_ident.name, sizeof(g_ident.name), b, n);
+    char *bracket = strchr(g_ident.name, '<'); if (bracket) *bracket = 0;
+  } else if (c->getUUID() == NimBLEUUID((uint16_t) 0x200a)) { n = readRegister(c, b, sizeof(b)); textFromBytes(g_ident.firmware, sizeof(g_ident.firmware), b, n); }
+  else if (c->getUUID() == NimBLEUUID((uint16_t) 0x200d))   { n = readRegister(c, b, sizeof(b)); textFromBytes(g_ident.serial, sizeof(g_ident.serial), b, n); }
+  else if (c->getUUID() == NimBLEUUID((uint16_t) 0x2009))   { n = readRegister(c, b, 1); g_ident.hardware = n >= 1 ? b[0] : 0; }
+  else if (c->getUUID() == NimBLEUUID((uint16_t) 0x200b))   { memset(g_ident.reg200b, 0, 2); readRegister(c, g_ident.reg200b, 2); }
+}
 static bool findFireplaceCharacteristics() {
+  memset(&g_ident, 0, sizeof(g_ident));
   g_chControl = g_chFlameLevel = g_chClock = g_chInit = nullptr;
   g_chHeater = g_chSetpoint = g_chHeaterPower = g_chTemperature = g_chUnknown3c = g_chUnknown63 = g_chExtra51 = g_chExtra26 = g_chExtra36 = g_chExtra24 = g_chSetpointLimits = g_chVolume = nullptr;
   for (auto *service : g_bleClient->getServices(true))
@@ -595,8 +626,12 @@ static bool findFireplaceCharacteristics() {
       // by 2: volume is 0x0074 instead of 0x0076, the handshake 0x0085 instead of 0x0087). These two are unique by UUID.
       if (c->getUUID() == NimBLEUUID((uint16_t) 0x4010)) g_chVolume = c;      // volume (models with a sound effect only)
       if (c->getUUID() == NimBLEUUID((uint16_t) 0x2001)) g_chInit = c;        // handshake register
+      readIdentity(c);
     }
-  logLine("ble", "volume register at 0x%04x, handshake register at 0x%04x", g_chVolume ? g_chVolume->getHandle() : 0, g_chInit ? g_chInit->getHandle() : 0);
+  g_ident.volumeHandle = g_chVolume ? g_chVolume->getHandle() : 0; g_ident.initHandle = g_chInit ? g_chInit->getHandle() : 0;
+  g_ident.known = g_chControl != nullptr;
+  logLine("ble", "volume register at 0x%04x, handshake register at 0x%04x", g_ident.volumeHandle, g_ident.initHandle);
+  logLine("ble", "fireplace %s, firmware %s, serial %s, 0x2009=%02x, 0x200b=%02x%02x", g_ident.name, g_ident.firmware, g_ident.serial, g_ident.hardware, g_ident.reg200b[0], g_ident.reg200b[1]);
   return g_chControl != nullptr;
 }
 
@@ -1140,6 +1175,7 @@ static const char *commandName(CommandType type) {
     case CMD_BLE_RESUME: return "bluetooth resume"; case CMD_SCAN: return "scan";
     case CMD_APPLY_SETTINGS: return "apply settings"; case CMD_FACTORY_RESET: return "factory reset";
     case CMD_CONTROL_MODE: return "control mode";   case CMD_APPLY_THERMOSTAT: return "thermostat settings";
+    case CMD_SET_HAS_SOUND: return "sound setting";
   }
   return "?";
 }
@@ -1163,6 +1199,11 @@ static void executeCommand(const Command &c) {
     case CMD_FACTORY_RESET:  bleFactoryReset(); break;
     case CMD_CONTROL_MODE:   bleSetControlMode((ControlMode) c.argument); break;
     case CMD_APPLY_THERMOSTAT: bleApplyThermostatSettings(); break;
+    case CMD_SET_HAS_SOUND:                                    // "My fireplace has sound": offers or hides Volume and Sound (web and Home Assistant)
+      g_hasSound = c.argument != 0;
+      g_prefs.begin("cfg", false); g_prefs.putBool("sound", g_hasSound); g_prefs.end();
+      setMessage(g_hasSound ? "Sound: Volume and Sound are offered" : "Sound: Volume and Sound are hidden");
+      break;
     case CMD_BLE_RELEASE:                                      // the original remote takes over: the bridge stops regulating
       g_thermostatWanted = false; setThermostatState(THERMO_INACTIVE);
       bleReleaseLink(); setMessage("Bluetooth released"); break;
@@ -1304,10 +1345,18 @@ static void forgetPublishedValues() {
 
 // Publish one Home Assistant discovery config: homeassistant/<component>/dimplex/<objectId>/config.
 // `body` is the JSON fields of the entity without braces; the shared device block is added here.
+static String g_deviceBlock = "\"dev\":{\"ids\":[\"dimplex_control\"],\"name\":\"Dimplex Control\",\"mf\":\"Dimplex\",\"mdl\":\"Opti-myst\"}";   // mqttTask only
+static String g_publishedIdentKey = "";          // what the last discovery was built from (identification and the sound setting)
+// Device block with the model and firmware read from the fireplace, once they are known (shown on the device page in Home Assistant).
+static String identKeyOf(const SharedState &s) { return String(s.ident.known ? "1" : "0") + s.ident.name + "|" + s.ident.firmware + "|" + (g_hasSound ? "sound" : "nosound"); }
+static void buildDeviceBlock(const FireplaceIdent &id) {
+  String model = "Opti-myst"; if (id.known && id.name[0]) model += String(" (") + id.name + ")";
+  g_deviceBlock = String("\"dev\":{\"ids\":[\"dimplex_control\"],\"name\":\"Dimplex Control\",\"mf\":\"Dimplex\",\"mdl\":\"") + model + "\"" +
+                  (id.known && id.firmware[0] ? String(",\"sw\":\"") + id.firmware + "\"" : String("")) + "}";
+}
 static void publishEntity(const char *component, const char *objectId, const String &body) {
-  static const char *deviceBlock = "\"dev\":{\"ids\":[\"dimplex_control\"],\"name\":\"Dimplex Control\",\"mf\":\"Dimplex\",\"mdl\":\"Opti-myst\"}";
   String topic = String("homeassistant/") + component + "/dimplex/" + objectId + "/config";
-  String payload = "{" + body + "," + deviceBlock + "}";
+  String payload = "{" + body + "," + g_deviceBlock + "}";
   g_mqttClient.publish(topic.c_str(), payload.c_str(), true);
 }
 // Remove an old discovery entity (retained empty payload).
@@ -1349,10 +1398,12 @@ static void publishHomeAssistantDiscovery() {
                 "\",\"stat_t\":\"" + TOPIC_POWER_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ic\":\"mdi:fireplace\"" + avail);
   publishEntity("number", "level", String("\"name\":\"Flame intensity\",\"uniq_id\":\"dimplex_level\",\"cmd_t\":\"") + TOPIC_FLAME_LEVEL_SET +
                 "\",\"stat_t\":\"" + TOPIC_FLAME_LEVEL_STATE + "\",\"min\":1,\"max\":6,\"step\":1,\"mode\":\"slider\",\"ic\":\"mdi:fire\"" + avail);
+  if (g_hasSound) {
   publishEntity("number", "volume", String("\"name\":\"Volume\",\"uniq_id\":\"dimplex_volume\",\"cmd_t\":\"") + TOPIC_VOLUME_SET +
                 "\",\"stat_t\":\"" + TOPIC_VOLUME_STATE + "\",\"min\":0,\"max\":6,\"step\":1,\"mode\":\"slider\",\"ic\":\"mdi:volume-high\"" + avail);
   publishEntity("switch", "sound", String("\"name\":\"Sound\",\"uniq_id\":\"dimplex_sound\",\"cmd_t\":\"") + TOPIC_SOUND_SET +
                 "\",\"stat_t\":\"" + TOPIC_SOUND_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ic\":\"mdi:volume-high\"" + avail);
+  } else { removeEntity("number", "volume"); removeEntity("switch", "sound"); }                // no sound effect: not offered
   publishEntity("switch", "heater_switch", String("\"name\":\"Heating control\",\"uniq_id\":\"dimplex_heater_switch\",\"cmd_t\":\"") + TOPIC_HEATER_SET +
                 "\",\"stat_t\":\"" + TOPIC_HEATER_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ic\":\"mdi:radiator\"" + avail);
   publishEntity("number", "setpoint_number", String("\"name\":\"Setpoint\",\"uniq_id\":\"dimplex_setpoint_number\",\"cmd_t\":\"") + TOPIC_SETPOINT_SET +
@@ -1398,11 +1449,11 @@ static void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     int level = atoi(text); if (level < 1) level = 1; if (level > 6) level = 6;
     queueMqttCommand(CMD_FLAME_LEVEL, level);
   }
-  else if (!strcmp(topic, TOPIC_VOLUME_SET)) {                                                                     // volume 0..6
+  else if (!strcmp(topic, TOPIC_VOLUME_SET) && g_hasSound) {                                                                     // volume 0..6
     int volume = atoi(text); if (volume < 0) volume = 0; if (volume > 6) volume = 6;
     queueMqttCommand(CMD_VOLUME, volume);
   }
-  else if (!strcmp(topic, TOPIC_SOUND_SET))      queueMqttCommand(CMD_VOLUME, isOn ? g_lastSoundVolume : 0);         // sound on/off
+  else if (!strcmp(topic, TOPIC_SOUND_SET) && g_hasSound) queueMqttCommand(CMD_VOLUME, isOn ? g_lastSoundVolume : 0);         // sound on/off
 }
 
 // Resolve the configured broker and point PubSubClient at it: numeric IP, *.local (mDNS) or plain DNS name.
@@ -1439,6 +1490,7 @@ static bool tryMqttConnect() {
     g_mqttClient.subscribe(TOPIC_HEATER_SET); g_mqttClient.subscribe(TOPIC_SETPOINT_SET); g_mqttClient.subscribe(TOPIC_BLE_SET);
     g_mqttClient.subscribe(TOPIC_ROOM_TEMPERATURE_SET);
     g_mqttClient.subscribe(TOPIC_VOLUME_SET); g_mqttClient.subscribe(TOPIC_SOUND_SET);
+    buildDeviceBlock(g_mqttSnapshot.ident); g_publishedIdentKey = identKeyOf(g_mqttSnapshot);
     publishHomeAssistantDiscovery();
     forgetPublishedValues();                       // republish everything after (re)connecting
     waitMs = 3000; failures = 0;
@@ -1452,6 +1504,9 @@ static bool tryMqttConnect() {
 }
 // Publish every value that differs from what was published last.
 static void publishChanges(const SharedState &s) {
+  // New identification or a changed sound setting: build the device block again and publish the entities again.
+  String identKey = identKeyOf(s);
+  if (identKey != g_publishedIdentKey) { g_publishedIdentKey = identKey; buildDeviceBlock(s.ident); publishHomeAssistantDiscovery(); forgetPublishedValues(); }
   bool hold = holdingForCommand();                          // older values of the controlled entities are skipped while true
   if (!hold && (int) s.bleEnabled != g_publishedBleEnabled) {       // known even while the link is released
     g_mqttClient.publish(TOPIC_BLE_STATE, s.bleEnabled ? "ON" : "OFF", true); g_publishedBleEnabled = s.bleEnabled;
@@ -1482,7 +1537,7 @@ static void publishChanges(const SharedState &s) {
     char text[4]; snprintf(text, sizeof(text), "%u", s.flameLevel); g_mqttClient.publish(TOPIC_FLAME_LEVEL_STATE, text, true); g_publishedFlameLevel = s.flameLevel;
     logLine("pub", "level=%u", s.flameLevel);
   }
-  if ((int) s.volume != g_publishedVolume) {                                 // volume 0..6 and the Sound switch (on = above 0)
+  if (g_hasSound && (int) s.volume != g_publishedVolume) {                                 // volume 0..6 and the Sound switch (on = above 0)
     char text[4]; snprintf(text, sizeof(text), "%u", s.volume); g_mqttClient.publish(TOPIC_VOLUME_STATE, text, true);
     g_mqttClient.publish(TOPIC_SOUND_STATE, s.volume > 0 ? "ON" : "OFF", true);
     if (s.volume > 0 && s.volume <= 6) g_lastSoundVolume = s.volume;
@@ -1771,8 +1826,9 @@ static String buildSettingsLive(const SharedState &s) {
        "Room sensor: the bridge regulates on the room temperature it receives over MQTT. Internal sensor: the bridge regulates on the sensor inside the fireplace. Margins and time-out: below.</p>";
 
 
-  h += "<h3>Volume</h3>" + linkButtonRow("vol", AW_VOLUME, ready ? s.volume : -1, 0, 6);
-  h += "<p class=dim>Only for models with a sound effect; has no effect on fireplaces without sound.</p>";
+  h += "<h3>Sound</h3><p class=dim>My fireplace has a sound effect: " + linkButton("Yes", setHref("sound=on"), s.hasSound) + linkButton("No", setHref("sound=off"), !s.hasSound) +
+       "<br>The register for the volume exists on every model, also on those without sound, so the bridge cannot see this by itself. Only when this is Yes the volume is shown here and Volume and Sound are offered to Home Assistant.</p>";
+  if (s.hasSound) h += "<h3>Volume</h3>" + linkButtonRow("vol", AW_VOLUME, ready ? s.volume : -1, 0, 6);
 
   h += "<h3>Fireplace</h3><p class=dim>Selected: <b>" + String(s.configuredAddress[0] ? s.configuredAddress : "auto-detect") + "</b> &middot; passkey " + htmlEscape(s.passkeyText);
   h += "<br>Connected to: " + String(s.ready ? s.targetAddress : "(not connected)") + "</p>";
@@ -1811,6 +1867,16 @@ static String buildDebugLive(const SharedState &s, uint32_t pending) {
     h += String("<tr><td>0x0024</td><td>") + e24 + "</td><td>polled by the remote, 0 so far (fault flags?)</td></tr></table>";
     h += "<p class=dim>Read " + String((millis() - s.lastReadMs) / 1000) + " s ago &middot; limits " + String(s.setpointMin) + "&ndash;" + String(s.setpointMax) + " &deg;C</p>";
   } else h += "<p class=dim>No data (not connected).</p>";
+
+  h += "<h3>Fireplace</h3>";
+  if (s.ident.known) {
+    char reg200b[6]; bytesToHex(reg200b, s.ident.reg200b, 2);
+    h += "<table><tr><td>Model (device name)</td><td>" + htmlEscape(s.ident.name) + "</td></tr><tr><td>Firmware</td><td>" + htmlEscape(s.ident.firmware) + "</td></tr>"
+         "<tr><td>Serial number</td><td>" + htmlEscape(s.ident.serial) + "</td></tr>"
+         "<tr><td>0x2009 / 0x200b</td><td>" + String(s.ident.hardware, HEX) + " / " + reg200b + "</td></tr>"
+         "<tr><td>Volume / handshake register</td><td>0x" + String(s.ident.volumeHandle, HEX) + " / 0x" + String(s.ident.initHandle, HEX) + "</td></tr></table>"
+         "<p class=dim>Read once per connection. Compare these values between units to find out which models differ (for example which have a sound effect); the sound setting is on the Settings page.</p>";
+  } else h += "<p class=dim>Not read yet (not connected since the start).</p>";
 
   h += "<h3>Temperature history <span class=dim>(internal sensor, newest first)</span></h3>";
   if (ready && s.historyCount > 0) {
@@ -2023,6 +2089,7 @@ static void handleSet() {
     queued &= queueCommand(CMD_APPLY_THERMOSTAT, 0, SOURCE_WEB);
   }
   if (g_webServer.hasArg("flame"))  { int n = g_webServer.arg("flame").toInt(); n = n < 1 ? 1 : (n > 6 ? 6 : n); request(CMD_FLAME_LEVEL, n, AW_FLAME_LEVEL, n); }
+  if (g_webServer.hasArg("sound"))  queued &= queueCommand(CMD_SET_HAS_SOUND, g_webServer.arg("sound") == "on" ? 1 : 0, SOURCE_WEB);
   if (g_webServer.hasArg("vol"))    { int n = g_webServer.arg("vol").toInt();   n = n < 0 ? 0 : (n > 6 ? 6 : n); request(CMD_VOLUME, n, AW_VOLUME, n); }
   if (g_webServer.hasArg("scan"))   queued &= queueCommand(CMD_SCAN, 0, SOURCE_WEB);
   if (g_webServer.hasArg("fpaddr") || g_webServer.hasArg("pkey")) {            // fireplace selection: the BLE task validates and applies it
