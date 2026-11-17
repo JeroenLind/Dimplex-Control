@@ -49,12 +49,12 @@ The fireplace's own weekly timer is not used: it stops working after a manual op
 | P10 | The program as a whole can be switched on and off, and its state is visible, over MQTT/Home Assistant (a switch). Editing the rules over MQTT is not required. |
 | P11 | No extra safety measures: the bridge executes what is in the list (no maximum run time, no check on Low water). The fireplace's own timer is left alone. |
 
-Open points still to be decided with the owner (nothing is assumed for these):
+| P12 | The **time zone** (with daylight saving time) is a setting on the Settings page. |
+| P13 | Rules that **overlap**, or whose on time equals the off time, are **not allowed**: the bridge refuses them with a message when they are added. |
+| P14 | A rule can be **switched off without deleting it** (a checkbox per rule). |
+| P15 | While the time is not known yet (no NTP), the Program page shows a notice and the list stays editable. The program does not execute anything until the time is known. |
 
-- Time zone and daylight saving time: the bridge currently has the time zone only in the source/portal. Which zone applies, and should it become a setting?
-- Rules that overlap, or an on time equal to the off time.
-- Whether a single rule can be switched off without deleting it.
-- What happens at the web page when the time is not synchronised yet.
+No open points remain for the requirements. Details of the design (storage format, task layout, page layout) are decided in the design phase.
 
 ### Non-goals
 - No cloud connection. Everything stays on the local network.
