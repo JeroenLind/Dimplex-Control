@@ -29,9 +29,9 @@ Dimplex Control is an ESP32 bridge for a **Dimplex Opti-myst electric fireplace*
 4. Be configurable without re-flashing (Wi-Fi, MQTT broker, fireplace address and passkey).
 5. Coexist with the original remote: the Bluetooth link can be released on demand.
 6. Be easy to follow and change: one sketch file with clear sections, English names and comments.
-7. Run a **weekly program** in the bridge itself (planned, see "Requirements: weekly program" below).
+7. Run a **weekly program** in the bridge itself (see "Requirements: weekly program" below and section 5.7).
 
-### Requirements: weekly program (planned, not implemented yet)
+### Requirements: weekly program
 
 The fireplace's own weekly timer is not used: it stops working after a manual operation. The bridge keeps its own program, independent of Home Assistant. The requirements below were agreed with the owner.
 
@@ -132,6 +132,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | `dimplex/setpoint/set` | degrees, e.g. `21` | Setpoint, rounded and clamped to the limits. Mode "Fireplace thermostat": the fireplace's setpoint, only while the heater is on. Bridge modes: the bridge's own setpoint, at any time |
 | `dimplex/level/set` | `1` to `6` | Flame level |
 | `dimplex/ble/set` | `ON` / `OFF` | `ON` = bridge holds the Bluetooth link; `OFF` = release it for the remote |
+| `dimplex/program/set` | `ON` / `OFF` | Switch the weekly program as a whole on or off (applied by `loop()` within a second) |
 | `dimplex/room_temperature/set` | degrees, e.g. `21.3` | Room temperature for the control mode "Room sensor (MQTT)". Plain number only; anything else is ignored. Publish without retain. Subscribed in every mode, only used in that mode |
 
 **State topics (published, retained):**
@@ -149,6 +150,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | `dimplex/control_mode/state` | text | Selected temperature control: `Fireplace thermostat`, `Room sensor (MQTT)`, `Internal sensor` (retained). Changed on the web page only |
 | `dimplex/thermostat/state` | text | `heating`, `target reached`, `no room temperature`, `off`, `not used` (retained) |
 | `dimplex/ble/state` | `ON` / `OFF` | Also published while the link is released |
+| `dimplex/program/state` | `ON` / `OFF` | The weekly program as a whole (retained) |
 | `dimplex/raw/state` | text | Registers that are not understood yet, for diagnostics, e.g. `3c=010300 63=003a 51=0100 26=00 36=0000 24=00`: `3c` is probably the load of the mist maker (about 1000 to 1100 in water, 3 when the disc is dry), `63` the intensity of the effect, and `51`, `26`, `36` and `24` are registers that are only watched (register-map.md). Registers that have their own entities are not repeated here; the Debug page and the CSV show the same registers |
 | `dimplex/diag/state` | JSON | Health values (restart reason, uptime, memory, signal, counters); published after connecting and then every 60 s |
 | `dimplex/status` | `online` / `offline` | Availability (last will) |
@@ -183,7 +185,8 @@ Served by the Arduino `WebServer` on port 80 from `loop()`.
 | Path | Purpose |
 |---|---|
 | `/` | Main page: Bluetooth link, flame effect, heating, setpoint, thermostat status, room temperature (room sensor mode), internal temperature |
-| `/settings` | Settings page: flame level, heater power, temperature control mode with margins and time-out, volume, fireplace selection (scan, address, passkey), factory reset |
+| `/program` | Program page: switch for the whole program, the list of rules (switch a rule off, delete) and the form to add one. `/program/set` changes it (`prog=0/1`, `toggle=<n>`, `del=<n>`, or the add form) and redirects back |
+| `/settings` | Settings page: time zone, flame level, heater power, temperature control mode with margins and time-out, volume, fireplace selection (scan, address, passkey), factory reset |
 | `/debug` | Debug page: the registers that are not understood yet (`0x003c`, `0x0063`, and the watched `0x0051`, `0x0026`, `0x0036`, `0x0024`), temperature history, CSV download, system information, restart |
 | `/live?p=<page>` | Only the live block of a page (HTML fragment); polled by the page script |
 | `/set?...` | Actions. Parameters: `ctl=fireplace/room/internal` (temperature control mode), `xoff`, `xon`, `ioff`, `ion` (margins in degrees) with `tmo` (time-out in minutes), `ble=on/off`, `fx=on/off`, `heater=on/off`, `hpwr=low/high`, `sp=<deg>`, `spd=<+/-1>`, `flame=1..6`, `vol=0..6`, `scan=1`, `fpaddr=<mac or auto>`, `pkey=<digits>`, `diag=reset`, `restart=1`, `factory=confirm`, plus `r=<page>` for the page to return to |
@@ -237,9 +240,16 @@ Namespace `cfg`:
 | `bsetp` | Setpoint of the bridge's control (15 to 30) |
 | `xoff`, `xon`, `ioff`, `ion` | Margins in tenths of a degree: room sensor off / on, internal sensor off / on |
 | `tmo` | Room temperature time-out in minutes |
-| `prog_rules` (blob), `prog_on`, `tz` | Weekly program (planned): the rules, the on/off state of the program as a whole, the time zone as POSIX TZ string (section 5.7) |
 
-The Wi-Fi credentials are stored by WiFiManager itself. A factory reset clears this namespace (temperature control settings included) and the Wi-Fi credentials, then restarts into the setup portal.
+Namespace `prog` (own `Preferences` object, because `loop()` writes it while `bleTask` uses the one for `cfg`):
+
+| Key | Contents |
+|---|---|
+| `rules` | Blob of the weekly program: count byte, then 6 bytes per rule (days, on time, off time, enabled), 20 rules at most (section 5.7) |
+| `on` | The program as a whole is on (default on) |
+| `tz` | Time zone as POSIX TZ string (default `CET-1CEST,M3.5.0,M10.5.0/3`) |
+
+The Wi-Fi credentials are stored by WiFiManager itself. A factory reset clears both namespaces (temperature control settings and the program included) and the Wi-Fi credentials, then restarts into the setup portal.
 
 ---
 
@@ -263,7 +273,7 @@ One file, `Dimplex-Control.ino`, in numbered sections:
 | 8. LEDs | `ledTask` |
 | 9. Setup | Setup portal, `setup()`, `loop()` |
 
-Three more files in the same folder: `icons.h` holds the app icons as PNG byte arrays, `waterwatch.h` holds the low water detection (section 5.6, also plain C++, tested by `test/waterwatch_test.cpp`), and `thermostat.h` holds the types and the decision logic of the temperature control (section 5.5). `thermostat.h` is plain C++ without Arduino calls, so `test/thermostat_test.cpp` can test it on a PC.
+Three more files in the same folder: `icons.h` holds the app icons as PNG byte arrays, `waterwatch.h` holds the low water detection (section 5.6, also plain C++, tested by `test/waterwatch_test.cpp`), `schedule.h` holds the weekly program (section 5.7, plain C++, tested by `test/schedule_test.cpp`), and `thermostat.h` holds the types and the decision logic of the temperature control (section 5.5). `thermostat.h` is plain C++ without Arduino calls, so `test/thermostat_test.cpp` can test it on a PC.
 
 All types (`struct`, `enum`) are defined above the first function. The Arduino IDE inserts automatic function prototypes before the first function, so a type defined after it breaks the build with errors like "does not name a type".
 
@@ -420,24 +430,26 @@ Register `0x003c` reads about 1000 to 1100 with the mist maker under water and 3
 - **No action:** the bridge only reports. The fireplace switches the flame effect off itself when it is dry; the heater is not touched by this detection.
 - **Web page:** a red notice on the Main page while low water is on; the Debug page shows the state next to register `0x003c`.
 
-### 5.7 Weekly program (planned, design)
-Implements requirements P1 to P15. Same split as the thermostat: the decisions are in a plain C++ header (`schedule.h`, tested on a PC in `test/schedule_test.cpp`), the switching reuses the existing commands.
+### 5.7 Weekly program
+Implements requirements P1 to P15. Same split as the thermostat: the decisions are in a plain C++ header (`schedule.h`, tested on a PC in `test/schedule_test.cpp`), the switching reuses the existing commands. The planner (`programTick()`), the rule editing and the page handlers are in the sketch, section 7 (web); `test/program_test.cpp` tests them against the PC stubs.
 
-**Rules.** `ScheduleRule { uint8_t days; uint16_t onMinute; uint16_t offMinute; bool enabled; }`: `days` is a bit mask (bit 0 Monday to bit 6 Sunday), times are minutes since midnight (0 to 1439). At most `SCHEDULE_MAX_RULES = 20` rules (P1). A rule whose off time is not later than its on time crosses midnight: it is on from the on time until the off time of the *next* day (P4). Stored as a blob of 20 x 6 bytes plus a count in NVS (`prog_rules`), written on every change (P8).
+**Rules.** `ScheduleRule { uint8_t days; uint16_t onMinute; uint16_t offMinute; bool enabled; }`: `days` is a bit mask (bit 0 Monday to bit 6 Sunday), times are minutes since midnight (0 to 1439). At most `SCHEDULE_MAX_RULES = 20` rules (P1). A rule whose off time is not later than its on time crosses midnight: it is on from the on time until the off time of the *next* day (P4). Stored as a blob of 20 x 6 bytes plus a count in NVS (namespace `prog`, key `rules`), written on every change (P8).
 
 **Validation (P13).** Each rule is expanded to intervals on a week of 10080 minutes (wrapping from Sunday to Monday). A rule is refused when its on time equals its off time, when it has no day, or when one of its intervals overlaps or touches an interval of another rule. Touching (off 18:00, on 18:00) counts as a conflict, because both moments would fall in the same minute. Disabled rules (P14) are checked too, so that enabling one later cannot create a conflict.
 
 **Deciding what is due.** `scheduleDue()` gets the rules, the local time as weekday, minute of day and a *minute key* (local date and minute) and returns *on*, *off* or nothing. A moment is due in the minute where a rule's on time (on one of its days) or off time (on the day after one of its days when it crosses midnight, otherwise on the same day) matches. Every minute key is handled once; the scheduler remembers the last key it handled. If `loop()` was held up for a few minutes the missed minutes are handled in order, with the last one winning. The very first call after a restart, or after the time becomes known, only stores the key: nothing is caught up (P7). Local time makes daylight saving behave as on a wall clock: a moment in the hour that is skipped in spring does not happen, a moment in the hour that is repeated in autumn is executed once, because the key is remembered.
 
-**Executing.** The scheduler runs in `loop()` once a second, and only when the program is switched on and the time is known. It does not read the fireplace state to decide: a due moment always gives a command (P5), so manual operation in between has no influence on later moments. On = the existing one-press heating command (`CMD_HEATER` with argument 2: flame effect first, then the heater, with the current mode, setpoint and power). Off = `CMD_FLAME_EFFECT` with argument 0, which also clears the heating wish (everything off, P3). Commands get `SOURCE_SCHEDULE` so that the log shows them, and they go through the same queue, so `bleTask` stays the only owner of Bluetooth.
+**Executing.** The scheduler runs in `loop()` once a second, and only when the program is switched on and the time is known. It does not read the fireplace state to decide: a due moment always gives a command (P5), so manual operation in between has no influence on later moments. On = the existing one-press heating command (`CMD_HEATER` with argument 2: flame effect first, then the heater, with the current mode, setpoint and power). Off = `CMD_FLAME_EFFECT` with argument 0, which also clears the heating wish (everything off, P3). Commands get `SOURCE_SCHEDULE` (log tag `program`) so that the log shows them, and they go through the same queue, so `bleTask` stays the only owner of Bluetooth.
 
 **Retry (P6).** After queuing, the scheduler keeps the action as *pending* with a deadline of 5 minutes. Every 30 seconds it checks the snapshot: on is done when the flame effect is on and the heating wish is set, off is done when the flame effect is off. If not done, the command is queued again. At the deadline it gives up and logs `program: gave up`. A newer moment replaces a pending action. While the link is released for the remote, the commands fail and are retried until the deadline; the program never takes the link back by itself.
 
-**Time zone (P12).** The POSIX TZ string (`tz` in NVS, default `CET-1CEST,M3.5.0,M10.5.0/3`) replaces the fixed string in `loop()`. The Settings page has a drop-down with common zones and a text field for another TZ string; applying it calls `setenv("TZ")` and `tzset()` without a restart. The fireplace clock (`writeFireplaceClock`) follows the same zone.
+**Time zone (P12).** The POSIX TZ string (`tz` in NVS namespace `prog`, default `CET-1CEST,M3.5.0,M10.5.0/3`) replaces the fixed string in `loop()`. The Settings page has a drop-down with common zones and a text field for another TZ string; applying it calls `setenv("TZ")` and `tzset()` without a restart. The fireplace clock (`writeFireplaceClock`) follows the same zone.
 
-**Web page `/program` (P9, P14, P15).** A fourth page in the menu: a notice when the time is not known, a switch for the program as a whole, a table of rules (days, on, off, enabled checkbox, delete button) and a form to add a rule (weekday checkboxes and two time fields). The page is plain forms (`/program/add`, `/program/delete`, `/program/toggle`, `/program/enable`), like the Settings page; a refused rule shows the reason. Because the list is changed from `loop()` only, no extra locking is needed; the scheduler and the pages run in the same task.
+**Web page `/program` (P9, P14, P15).** A fourth page in the menu: a notice when the time is not known, a switch for the program as a whole, a table of rules (days, on, off, enabled checkbox, delete button) and a form to add a rule (weekday checkboxes and two time fields). The page is plain forms (all of them `/program/set` with different arguments), like the Settings page; a refused rule shows the reason. Because the list is changed from `loop()` only, no extra locking is needed; the scheduler and the pages run in the same task.
 
-**MQTT (P10).** Switch `dimplex/program/set` (`ON`/`OFF`) with retained state `dimplex/program/state`, discovered as a switch entity `program` in the same device. Rules are not exposed over MQTT.
+**MQTT (P10).** Switch `dimplex/program/set` (`ON`/`OFF`) with retained state `dimplex/program/state`, discovered as the switch entity `program` ("Program", category config) in the same device. `mqttTask` only stores the request; `loop()` applies it, so `loop()` stays the only writer of the program. Rules are not exposed over MQTT.
+
+**Defaults and details chosen in the implementation:** the program is on by default (so new rules work at once); the first tick after the time becomes known or the program is switched on only stores the time (no catch-up); changing the time zone also resets that, because the clock jumps; the switch for the program uses the argument `prog`, because the add form already uses `on` for the on time.
 
 **Decisions made in this design that you can still change:**
 - Touching intervals (off time of one rule equals the on time of another) are refused, not allowed.
@@ -445,7 +457,7 @@ Implements requirements P1 to P15. Same split as the thermostat: the decisions a
 - On a due moment the scheduler does not take back a released Bluetooth link; it retries until the deadline.
 - Retry uses the snapshot (effect on and heating wish set) as proof of success.
 
-**Tests.** `schedule_test.cpp`: validation (overlap, touching, midnight crossing, week wrap, no day), due moments per weekday, midnight crossing, no catch-up at the first call, several missed minutes, daylight saving (skipped and repeated hour), dedupe within a minute.
+**Tests.** `test/program_test.cpp` (against the stubs: adding with the overlap check, survival of a restart, the on command at the on time, retry after 30 s, give-up, the off command, the MQTT switch, the time zone form, rendering of both pages, delete). `schedule_test.cpp`: validation (overlap, touching, midnight crossing, week wrap, no day), due moments per weekday, midnight crossing, no catch-up at the first call, several missed minutes, daylight saving (skipped and repeated hour), dedupe within a minute.
 
 ---
 
@@ -591,6 +603,7 @@ Dimplex Control is meant for a trusted home network. Known limits:
 
 - **Simulation on a PC.** The sketch is compiled with `g++ -Wall -Wextra` against stub versions of the Arduino, WiFi, WebServer, NimBLE, PubSubClient and related headers, with a simulated fireplace (optionally slow to report changes), a simulated broker and a simulated web client. About 90 checks cover: command execution and ordering, the web pages and live block, button feedback, fireplace selection and validation, factory reset, MQTT discovery and commands, the echo without flicker against a fireplace that needs 1.5 s, the deadband, Bluetooth release and resume, the LED states, a broker that does not answer, a lost BLE link in the middle of a command, and the crash diagnostics (previous session log, restart reason, planned restart, health sensors) and the Wi-Fi watchdog (with shortened delays).
 - **Unit test of the low water detection.** `test/waterwatch_test.cpp` replays the empty-tank test of 10 Nov (on, bounce while putting the mist maker back, off) and tests single odd readings, `0xffff`, start-up and standby: `g++ -std=c++17 -Wall -Wextra -I Dimplex-Control test/waterwatch_test.cpp -o waterwatch_test && ./waterwatch_test`.
+- **Unit test of the weekly program.** `test/schedule_test.cpp` tests `schedule.h` (see section 5.7); `test/program_test.cpp` tests the planner and the page handlers in the sketch with the PC stubs (build line in the file).
 - **Unit test of the thermostat.** `test/thermostat_test.cpp` tests `thermostat.h` without stubs (hysteresis for both sensors, start rule, fail-safe and recovery, settings validation, parsing of MQTT payloads): `g++ -std=c++17 -Wall -Wextra -I Dimplex-Control test/thermostat_test.cpp -o thermostat_test && ./thermostat_test`.
 - **Measured in the simulation:** the slowest web request stayed in the order of a few milliseconds while BLE and MQTT were blocked.
 - **Not tested:** the real ESP32, the real NimBLE and Wi-Fi coexistence timing, the stack sizes, Home Assistant itself, and long-term behaviour (heap over 24 hours). The first real test of each of those is on the hardware. The Debug page shows the numbers needed (loop gap, request time, free stack, free heap).
@@ -604,14 +617,14 @@ Dimplex Control is meant for a trusted home network. Known limits:
 |---|---|
 | Thermostat behaviour | Issue #1 addresses this with the temperature control in the bridge (section 5.5). In one measured run the heating element kept running while the internal sensor (`0x0055`) was 1.2 °C above the setpoint. The fireplace probably regulates on a different sensor. See `experiments.md`. The bridge shows `0x0055` as "internal temperature", not as room temperature. |
 | Radio sharing | Wi-Fi and Bluetooth share the radio on the ESP32. While the bridge scans or connects, web responses can be slower by tens to hundreds of milliseconds. |
-| Time zone | Fixed in `loop()` (Central European Time). Change the TZ string for other regions. |
+| Time zone | Chosen on the Settings page (list or TZ string); applies to the program and the fireplace clock. At the first start it is Central European Time. |
 | Single fireplace | One address, one BLE link. |
 | Polling | A change made with the remote can take up to 5 s to appear. Notifications might remove the polling; not investigated. |
 | Fixed delays | The 650 ms pause when starting the heater and the read-back timing are taken from the remote's behaviour and have not been tuned on real hardware. A measurement run using the log line `state confirmed after N ms` would show how much can be saved. |
 | Web feedback for MQTT commands | Only commands from the web page mark buttons as waiting. Commands from MQTT or the remote show only the "Working" line. |
 | Authentication | None on the web interface (section 9). |
 | HTTPS | The bridge serves plain HTTP only. Chrome on Android therefore needs a flag or a reverse proxy to install the app (section 3.4). |
-| Other ideas | Over-the-air updates (see the reminders below); a settings page for MQTT and time zone (now only in the portal and in the source); a control mode that can be chosen from Home Assistant; a configurable topic for the room temperature; a program or timer function (the weekly timer registers are documented in `register-map.md` but not used). |
+| Other ideas | Over-the-air updates (see the reminders below); a settings page for MQTT (now only in the portal); a control mode that can be chosen from Home Assistant; a configurable topic for the room temperature; the weekly timer registers of the fireplace itself are documented in `register-map.md` but not used (the bridge has its own program). |
 
 ### Reminders: debugging in the field (not implemented yet)
 

@@ -148,6 +148,10 @@ class Preferences {
   uint32_t getUInt(const char *k, uint32_t d = 0) { auto &m = store()[ns_]; return m.count(k) ? (uint32_t) strtoul(m[k].c_str(), nullptr, 10) : d; }
   size_t putUInt(const char *k, uint32_t v) { store()[ns_][k] = std::to_string(v); return 4; }
   bool has(const char *k) { return store()[ns_].count(k) > 0; }
+  bool getBool(const char *k, bool d = false) { auto &m = store()[ns_]; return m.count(k) ? m[k] != "0" : d; }
+  size_t putBool(const char *k, bool v) { store()[ns_][k] = v ? "1" : "0"; return 1; }
+  size_t getBytes(const char *k, void *buf, size_t max) { auto &m = store()[ns_]; if (!m.count(k)) return 0; size_t n = m[k].size() < max ? m[k].size() : max; memcpy(buf, m[k].data(), n); return n; }
+  size_t putBytes(const char *k, const void *buf, size_t len) { store()[ns_][k] = std::string((const char *) buf, len); return len; }
 };
 
 // ---- WiFiManager ----
