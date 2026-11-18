@@ -1037,8 +1037,7 @@ static bool bleSetSetpoint(int degrees) {
 // Heater power: 0x0048 = 01 (low, 0.9 kW) / 03 (high, 1.8 kW). Confirmed with a power meter; the fireplace remembers it.
 static bool bleSetHeaterPower(bool high) {
   if (!requireBleReady() || !g_chHeaterPower) return false;
-  readFireplaceState();
-  if (!heaterIsOn()) { setMessage("Heater power not changed: the heater is off"); return false; }
+  // TEST BRANCH: no "heater must be on" check here. The write is always sent; the read-back below reports whether the fireplace accepted it.
   uint8_t value = high ? 0x03 : 0x01;
   bool ok = writeRegister(g_chHeaterPower, &value, 1);
   logLine("ble", "heater power -> %s (0x0048=%02x) write=%d", high ? "HIGH" : "LOW", value, ok);
