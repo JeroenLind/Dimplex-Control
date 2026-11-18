@@ -58,6 +58,7 @@
 #include "icons.h"           // app icons for "install on the phone" (second tab in the Arduino IDE)
 #include "thermostat.h"      // temperature control types and decision logic (third tab; plain C++, tested on a PC)
 #include "waterwatch.h"      // low water detection on register 0x003c (plain C++, tested on a PC)
+#include "schedule.h"        // weekly program: rules, validation, due moments (plain C++, tested on a PC)
 
 // =====================================================================================================
 // 1. SETTINGS
@@ -128,6 +129,8 @@ static const char *TOPIC_HEATER_ELEMENT_STATE = "dimplex/heater_element/state"; 
 static const char *TOPIC_SETPOINT_SET       = "dimplex/setpoint/set";       // degrees C (15..30), only while the heater is on
 static const char *TOPIC_SETPOINT_STATE     = "dimplex/setpoint/state";     // 0x0018, non-zero only while the heater is on
 static const char *TOPIC_BLE_SET            = "dimplex/ble/set";            // ON = bridge connects to the fireplace, OFF = release the link (remote can connect)
+static const char *TOPIC_PROGRAM_SET         = "dimplex/program/set";        // ON/OFF: the weekly program as a whole
+static const char *TOPIC_PROGRAM_STATE       = "dimplex/program/state";
 static const char *TOPIC_BLE_STATE          = "dimplex/ble/state";          // ON/OFF: whether the bridge is allowed to hold the BLE link
 static const char *TOPIC_HEATER_POWER_STATE = "dimplex/heater_power/state"; // low/high (0x0048: 01 = 0.9 kW, 03 = 1.8 kW); `None` for any other value
 static const char *TOPIC_HEATER_POWER_SET   = "dimplex/heater_power/set";   // low / high (any case)
@@ -153,7 +156,7 @@ static bool g_webStarted = false;
 enum CommandType : uint8_t { CMD_FLAME_EFFECT, CMD_HEATER, CMD_HEATER_POWER, CMD_SETPOINT, CMD_SETPOINT_DELTA,
                              CMD_FLAME_LEVEL, CMD_VOLUME, CMD_BLE_RELEASE, CMD_BLE_RESUME,
                              CMD_SCAN, CMD_APPLY_SETTINGS, CMD_FACTORY_RESET, CMD_CONTROL_MODE, CMD_APPLY_THERMOSTAT, CMD_SET_HAS_SOUND };
-enum CommandSource : uint8_t { SOURCE_WEB = 0, SOURCE_MQTT = 1 };
+enum CommandSource : uint8_t { SOURCE_WEB = 0, SOURCE_MQTT = 1, SOURCE_SCHEDULE = 2 };
 struct Command { CommandType type; int16_t argument; CommandSource source; };
 static QueueHandle_t g_commandQueue = nullptr;
 static SemaphoreHandle_t g_snapshotMutex = nullptr;
@@ -425,6 +428,13 @@ static uint8_t g_flameLevel = 0, g_volume = 0;
 static FireplaceIdent g_ident = {};               // written by bleTask
 static volatile bool g_hasSound = false;          // flash key "sound": Volume and Sound are only offered when this is set (default off)
 static WaterWatch g_waterWatch = {};            // low water detection on 0x003c (bleTask only)
+
+// ---- weekly program (docs/design.md section 5.7). The rules are owned by loop(); mqttTask only reads g_programOn. ----
+static ScheduleRule g_rules[SCHEDULE_MAX_RULES];
+static int g_ruleCount = 0;
+static volatile bool g_programOn = true;         // the program as a whole (flash "prog"/"on"); on by default so that new rules work
+static volatile int8_t g_programSetRequest = -1; // 0/1 from MQTT, applied by loop()
+static char g_timeZone[48] = "CET-1CEST,M3.5.0,M10.5.0/3";   // POSIX TZ string (flash "prog"/"tz")
 static int g_setpoint = 0;                      // 0x0018 (0 while the heater is off)
 static int g_setpointMin = 15, g_setpointMax = 30;   // replaced by the limits read from 0x001e
 static String g_message = "";                   // result of the last action; shown on the web page for a few seconds
@@ -493,6 +503,22 @@ static void parsePasskey() {
   unsigned long k = strtoul(cfg_passkeyText, nullptr, 10);
   g_passkeyNumber = (k > 0 && k <= 999999) ? (uint32_t) k : 64259;
 }
+// Weekly program and time zone: own namespace "prog" and own Preferences object, because loop() writes them while bleTask uses g_prefs.
+static void loadProgram() {
+  Preferences p; p.begin("prog", true);
+  String tz = p.getString("tz", g_timeZone);
+  if (tz.length() > 2 && tz.length() < sizeof(g_timeZone)) strlcpy(g_timeZone, tz.c_str(), sizeof(g_timeZone));
+  g_programOn = p.getBool("on", true);
+  uint8_t blob[SCHEDULE_BLOB_SIZE]; size_t got = p.getBytes("rules", blob, sizeof(blob));
+  g_ruleCount = got ? scheduleDecode(blob, got, g_rules) : 0;
+  p.end();
+}
+static void saveProgramRules() {
+  uint8_t blob[SCHEDULE_BLOB_SIZE]; scheduleEncode(g_rules, g_ruleCount, blob);
+  Preferences p; p.begin("prog", false); p.putBytes("rules", blob, sizeof(blob)); p.end();
+}
+static void saveProgramOn() { Preferences p; p.begin("prog", false); p.putBool("on", g_programOn); p.end(); }
+static void saveTimeZone() { Preferences p; p.begin("prog", false); p.putString("tz", g_timeZone); p.end(); }
 // Read all settings from flash. A value that was never saved keeps its default from section 1.
 static void loadSettings() {
   g_prefs.begin("cfg", true);
@@ -515,6 +541,7 @@ static void loadSettings() {
   if (thermostatSettingsValid(loaded.externalOffAbove, loaded.externalOnBelow, loaded.internalOffAbove, loaded.internalOnBelow, loaded.timeoutMinutes)) g_thermo = loaded;
   g_prefs.end();
   parsePasskey();
+  loadProgram();
 }
 // Save the control mode (flash is only written when the value changes).
 static void saveControlMode() { g_prefs.begin("cfg", false); g_prefs.putUChar("ctlmode", (uint8_t) g_controlMode); g_prefs.end(); }
@@ -1160,6 +1187,7 @@ static void bleFactoryReset() {
   publishSnapshot();
   bleReleaseLink();
   g_prefs.begin("cfg", false); g_prefs.clear(); g_prefs.end();
+  { Preferences p; p.begin("prog", false); p.clear(); p.end(); }
   g_wifiManager.resetSettings();
   logLine("cfg", "factory reset done, restarting");
   delay(1500);                                      // let the web page show its message
@@ -1210,7 +1238,7 @@ static void executeCommand(const Command &c) {
       bleReleaseLink(); setMessage("Bluetooth released"); break;
     case CMD_BLE_RESUME:   bleResumeLink(); setMessage("Connecting..."); break;
   }
-  if (g_messageDirty) logLine(c.source == SOURCE_MQTT ? "mqtt" : "web", "%s", g_message.c_str());
+  if (g_messageDirty) logLine(c.source == SOURCE_MQTT ? "mqtt" : (c.source == SOURCE_SCHEDULE ? "program" : "web"), "%s", g_message.c_str());
 }
 
 // BLE task: connects (and reconnects) to the fireplace, runs the queued commands in order and
@@ -1267,6 +1295,7 @@ static void bleTask(void *) {
 // 6. MQTT (everything in this section runs in mqttTask)
 // =====================================================================================================
 // What was last published, so only changes are sent. -1 / empty = unknown (publish at the next chance).
+static int g_publishedProgram = -1;           // 0/1
 static int g_publishedBleEnabled = -1;       // 0/1
 static int g_publishedPower = -1, g_publishedFlameLevel = -1, g_publishedHeater = -1, g_publishedHeaterElement = -1, g_publishedLowWater = -1;
 static int g_publishedHeaterPower = -1;        // 0 = low, 1 = high, 2 = unknown value
@@ -1337,7 +1366,7 @@ static void queueMqttCommand(CommandType type, int argument) {
 
 // Forget what was published, so the next publishChanges() sends everything again.
 static void forgetPublishedValues() {
-  g_publishedBleEnabled = -1;
+  g_publishedBleEnabled = g_publishedProgram = -1;
   g_publishedPower = g_publishedFlameLevel = g_publishedHeater = g_publishedHeaterElement = g_publishedLowWater = g_publishedHeaterPower = g_publishedSetpoint = g_publishedVolume = -1;
   g_publishedTemperatureTenths = -1; g_publishedRaw[0] = 0;
   g_publishedControlMode = g_publishedThermostat = -1;
@@ -1415,6 +1444,8 @@ static void publishHomeAssistantDiscovery() {
                 "\",\"stat_t\":\"" + TOPIC_HEATER_POWER_STATE + "\",\"options\":[\"low\",\"high\"],\"ic\":\"mdi:flash\"" + avail);
   publishEntity("switch", "ble", String("\"name\":\"Bluetooth link\",\"uniq_id\":\"dimplex_ble_link\",\"cmd_t\":\"") + TOPIC_BLE_SET +
                 "\",\"stat_t\":\"" + TOPIC_BLE_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ent_cat\":\"config\",\"ic\":\"mdi:bluetooth\"" + avail);
+  publishEntity("switch", "program", String("\"name\":\"Program\",\"uniq_id\":\"dimplex_program\",\"cmd_t\":\"") + TOPIC_PROGRAM_SET +
+                "\",\"stat_t\":\"" + TOPIC_PROGRAM_STATE + "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ent_cat\":\"config\",\"ic\":\"mdi:calendar-clock\"" + avail);
   // ---- read-only ----
   publishEntity("sensor", "level", String("\"name\":\"Flame intensity state\",\"uniq_id\":\"dimplex_levelstate\",\"stat_t\":\"") + TOPIC_FLAME_LEVEL_STATE +
                 "\",\"ic\":\"mdi:fire\"" + avail);
@@ -1440,6 +1471,7 @@ static void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   bool isOn = strcmp(text, "ON") == 0;
   if (!strcmp(topic, TOPIC_POWER_SET))           queueMqttCommand(CMD_FLAME_EFFECT, isOn ? 1 : 0);                  // flame effect on/off
   else if (!strcmp(topic, TOPIC_BLE_SET))        queueMqttCommand(isOn ? CMD_BLE_RESUME : CMD_BLE_RELEASE, 0);         // Bluetooth link on/off
+  else if (!strcmp(topic, TOPIC_PROGRAM_SET))    { if (isOn || !strcmp(text, "OFF")) g_programSetRequest = isOn ? 1 : 0; }   // applied by loop()
   else if (!strcmp(topic, TOPIC_HEATER_SET))     queueMqttCommand(CMD_HEATER, isOn ? 1 : 0);                        // heater on/off
   else if (!strcmp(topic, TOPIC_HEATER_POWER_SET)) {                                                                // heater power low/high (not echoed: the state follows the read-back)
     if (!strcasecmp(text, "low") || !strcasecmp(text, "high")) queueMqttCommand(CMD_HEATER_POWER, strcasecmp(text, "high") == 0 ? 1 : 0);
@@ -1494,7 +1526,7 @@ static bool tryMqttConnect() {
     g_mqttClient.publish(TOPIC_AVAILABILITY, "online", true);
     g_mqttClient.subscribe(TOPIC_POWER_SET); g_mqttClient.subscribe(TOPIC_FLAME_LEVEL_SET);
     g_mqttClient.subscribe(TOPIC_HEATER_SET); g_mqttClient.subscribe(TOPIC_SETPOINT_SET); g_mqttClient.subscribe(TOPIC_BLE_SET);
-    g_mqttClient.subscribe(TOPIC_ROOM_TEMPERATURE_SET); g_mqttClient.subscribe(TOPIC_HEATER_POWER_SET);
+    g_mqttClient.subscribe(TOPIC_ROOM_TEMPERATURE_SET); g_mqttClient.subscribe(TOPIC_HEATER_POWER_SET); g_mqttClient.subscribe(TOPIC_PROGRAM_SET);
     g_mqttClient.subscribe(TOPIC_VOLUME_SET); g_mqttClient.subscribe(TOPIC_SOUND_SET);
     buildDeviceBlock(g_mqttSnapshot.ident); g_publishedIdentKey = identKeyOf(g_mqttSnapshot);
     publishHomeAssistantDiscovery();
@@ -1518,6 +1550,7 @@ static void publishChanges(const SharedState &s) {
     g_mqttClient.publish(TOPIC_BLE_STATE, s.bleEnabled ? "ON" : "OFF", true); g_publishedBleEnabled = s.bleEnabled;
     logLine("pub", "ble link enabled=%d", s.bleEnabled);
   }
+  if ((int) g_programOn != g_publishedProgram) { g_mqttClient.publish(TOPIC_PROGRAM_STATE, g_programOn ? "ON" : "OFF", true); g_publishedProgram = g_programOn; logLine("pub", "program=%d", (int) g_programOn); }
   // The temperature control mode and the thermostat status do not depend on the Bluetooth link: publish them at once.
   if ((int) s.controlMode != g_publishedControlMode) {
     g_mqttClient.publish(TOPIC_CONTROL_MODE_STATE, controlModeText(s.controlMode), true); g_publishedControlMode = s.controlMode;
@@ -1628,10 +1661,79 @@ static void mqttTask(void *) {
 //   /          Main      Bluetooth link, flame effect, heater, setpoint (+ the internal temperature)
 //   /settings  Settings  flame level, heater power, volume, fireplace selection, factory reset
 //   /debug     Debug     raw registers, temperature table, status log download, system information
+// ---- weekly program: planner, rule editing, page (docs/design.md section 5.7). All of it runs in loop(). ----
+#define PROGRAM_RETRY_MS     30000UL     // check the result and send the command again after this long
+#define PROGRAM_GIVE_UP_MS   300000UL    // give up after 5 minutes (requirement P6)
+static ScheduleState g_scheduleState = { false, 0 };
+static struct { ScheduleAction action; uint32_t startMs; uint32_t lastTryMs; bool tried; } g_programPending = { SCHED_NONE, 0, 0, false };
+static bool g_timeKnown = false;                 // local time is valid (NTP has synced)
+
+static void setProgramOn(bool on) {
+  if (g_programOn == on) return;
+  g_programOn = on; saveProgramOn();
+  logLine("program", "program %s", on ? "on" : "off");
+}
+// Local time as minute key and weekday (0 = Monday); false while NTP has not synced.
+static bool localMinuteKey(uint32_t &key, int &weekday) {
+  struct tm t; if (!getLocalTime(&t, 0)) return false;
+  key = scheduleDayNumber(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday) * 1440u + (uint32_t)(t.tm_hour * 60 + t.tm_min);
+  weekday = (t.tm_wday + 6) % 7;
+  return true;
+}
+// Is the fireplace in the state the action wants? (snapshot of bleTask's state)
+static bool programActionDone(ScheduleAction a) {
+  copySnapshot(g_webSnapshot);
+  const SharedState &s = g_webSnapshot;
+  if (!s.valid) return false;
+  return a == SCHED_ON ? (isFlameEffectOn(s) && isHeaterSwitchOn(s)) : !isFlameEffectOn(s);
+}
+static void sendProgramCommand(ScheduleAction a) {
+  bool ok = a == SCHED_ON ? queueCommand(CMD_HEATER, 2, SOURCE_SCHEDULE)          // flame effect first, then the heater, as the web button does
+                          : queueCommand(CMD_FLAME_EFFECT, 0, SOURCE_SCHEDULE);   // everything off
+  if (!ok) logLine("program", "command queue full, will retry");
+}
+// Called every pass of loop(); acts once a second.
+static void programTick() {
+  static uint32_t lastMs = 0;
+  if (millis() - lastMs < 1000) return;
+  lastMs = millis();
+  if (g_programSetRequest >= 0) { bool on = g_programSetRequest != 0; g_programSetRequest = -1; setProgramOn(on); }
+  uint32_t key; int weekday;
+  g_timeKnown = localMinuteKey(key, weekday);
+  if (!g_timeKnown || !g_programOn) { scheduleReset(g_scheduleState); g_programPending.action = SCHED_NONE; return; }   // no catch-up later (P7)
+  ScheduleAction due = scheduleDue(g_rules, g_ruleCount, g_scheduleState, key, weekday);
+  if (due != SCHED_NONE) {
+    g_programPending.action = due; g_programPending.startMs = millis(); g_programPending.tried = false;
+    logLine("program", "moment due: %s", due == SCHED_ON ? "on" : "off");
+  }
+  if (g_programPending.action == SCHED_NONE) return;
+  uint32_t now = millis();
+  if (g_programPending.tried && now - g_programPending.lastTryMs < PROGRAM_RETRY_MS) return;
+  if (g_programPending.tried && programActionDone(g_programPending.action)) { logLine("program", "done"); g_programPending.action = SCHED_NONE; return; }
+  if (now - g_programPending.startMs >= PROGRAM_GIVE_UP_MS) { logLine("program", "gave up: the fireplace did not follow within 5 minutes"); g_programPending.action = SCHED_NONE; return; }
+  g_programPending.tried = true; g_programPending.lastTryMs = now;
+  sendProgramCommand(g_programPending.action);
+}
+
+// "HH:MM" -> minutes since midnight, or -1.
+static int parseClockMinutes(const String &text) {
+  const char *c = text.c_str();
+  if (text.length() != 5 || c[2] != ':') return -1;
+  if (!isdigit(c[0]) || !isdigit(c[1]) || !isdigit(c[3]) || !isdigit(c[4])) return -1;
+  int h = (c[0] - '0') * 10 + (c[1] - '0'), m = (c[3] - '0') * 10 + (c[4] - '0');
+  return (h > 23 || m > 59) ? -1 : h * 60 + m;
+}
+static String clockText(int minutes) { char b[8]; snprintf(b, sizeof(b), "%02d:%02d", minutes / 60, minutes % 60); return String(b); }
+static String daysText(uint8_t days) {
+  static const char *names[7] = { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+  if ((days & 0x7f) == 0x7f) return "Every day";
+  String t; for (int d = 0; d < 7; d++) if (days & (1 << d)) { if (t.length()) t += " "; t += names[d]; }
+  return t;
+}
 // Each page is a fixed frame around one "live" block. The page script fetches /live?p=<page> every few seconds and
 // replaces that block, so values follow the fireplace without pressing a button. Forms are placed outside the
 // live block, so a refresh never clears what you are typing.
-static const char *PAGE_MAIN = "main", *PAGE_SETTINGS = "settings", *PAGE_DEBUG = "debug";
+static const char *PAGE_MAIN = "main", *PAGE_SETTINGS = "settings", *PAGE_DEBUG = "debug", *PAGE_PROGRAM = "program";
 static const char *g_renderPage = PAGE_MAIN;   // page being rendered: buttons return to the same page after a press
 static String g_webMessage = "";               // message generated by the web layer itself
 static uint32_t g_webMessageTimeMs = 0;
@@ -1922,6 +2024,14 @@ static String buildDebugLive(const SharedState &s, uint32_t pending) {
   return h;
 }
 
+// Live block of the Program page: only what changes by itself (time known, what the program is doing now).
+static String buildProgramLive() {
+  String h;
+  if (!g_timeKnown) h += "<p class=msg>The time is not known yet (no NTP). The program does not run until it is; you can already edit the list.</p>";
+  if (g_programOn && g_programPending.action != SCHED_NONE)
+    h += String("<p class=dim>Busy: switching ") + (g_programPending.action == SCHED_ON ? "on" : "off") + ", trying until the fireplace follows (max 5 minutes).</p>";
+  return h;
+}
 // Build the live block of one page (also used inside the full page). Takes a fresh snapshot first.
 static String buildLiveHtml(const char *page) {
   g_renderPage = page;
@@ -1930,7 +2040,8 @@ static String buildLiveHtml(const char *page) {
   uint32_t pending = pendingCommands();
   updateAwaited(s, pending);
   String h = buildLiveHeader(s, pending);
-  if (page == PAGE_SETTINGS)   h += buildSettingsLive(s);
+  if (page == PAGE_PROGRAM)    h += buildProgramLive();
+  else if (page == PAGE_SETTINGS) h += buildSettingsLive(s);
   else if (page == PAGE_DEBUG) h += buildDebugLive(s, pending);
   else                         h += buildMainLive(s);
   return h;
@@ -1939,6 +2050,7 @@ static String buildLiveHtml(const char *page) {
 static const char *pageFromName(const String &name) {
   if (name == "settings") return PAGE_SETTINGS;
   if (name == "debug") return PAGE_DEBUG;
+  if (name == "program") return PAGE_PROGRAM;
   return PAGE_MAIN;
 }
 
@@ -1962,7 +2074,7 @@ static void sendPage(const char *page, const String &afterLive) {
              ".nav.on{background:#e25822;color:#fff}nav{border-bottom:3px solid #e25822;margin-bottom:8px}"
              ".big{font-size:230%;font-weight:bold}table{border-collapse:collapse}td,th{padding:2px 8px;text-align:left}"
              ".dim{color:#888;font-size:90%}input[type=number]{width:70px;padding:9px;font-size:100%}input[type=text]{padding:9px;font-size:100%;width:12em}</style></head><body>"
-             "<h2>&#128293; Dimplex Control</h2><nav>" + navLink(PAGE_MAIN, "/", "Main") + navLink(PAGE_SETTINGS, "/settings", "Settings") + navLink(PAGE_DEBUG, "/debug", "Debug") +
+             "<h2>&#128293; Dimplex Control</h2><nav>" + navLink(PAGE_MAIN, "/", "Main") + navLink(PAGE_PROGRAM, "/program", "Program") + navLink(PAGE_SETTINGS, "/settings", "Settings") + navLink(PAGE_DEBUG, "/debug", "Debug") +
              "</nav><div id=live>" + live + "</div>" + afterLive;
   h += String("<script>var box=document.getElementById('live');"
               "function tick(){fetch('/live?p=") + page + "',{cache:'no-store'}).then(function(r){return r.text()}).then(function(t){"
@@ -1972,6 +2084,57 @@ static void sendPage(const char *page, const String &afterLive) {
        "setTimeout(tick," + String(PAGE_REFRESH_MS) + ");"
        "if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(function(){});</script></body></html>";
   g_webServer.send(200, "text/html", h);
+}
+
+// Program page: the switch for the program as a whole, the list of rules and the form to add one (static, outside the live block).
+static void handleProgramPage() {
+  buildLiveHtml(PAGE_PROGRAM);
+  String form = String("<h3>Program</h3><p>") + (g_programOn ? "<a class='b on' href='/program/set?prog=0'>Program on</a>" : "<a class='b off' href='/program/set?prog=1'>Program off</a>") +
+                "<br><span class=dim>At the on time the flame effect and heating are switched on (with the current settings), at the off time everything is switched off. "
+                "Every moment is carried out, also after you operated the fireplace by hand in between. Time zone: " + htmlEscape(g_timeZone) + " (change it on the Settings page).</span></p>";
+  if (g_ruleCount == 0) form += "<p class=dim>No rules yet.</p>";
+  else {
+    form += "<table><tr><th>Days</th><th>On</th><th>Off</th><th>Active</th><th></th></tr>";
+    for (int i = 0; i < g_ruleCount; i++) {
+      const ScheduleRule &r = g_rules[i];
+      form += "<tr><td>" + daysText(r.days) + "</td><td>" + clockText(r.onMinute) + "</td><td>" + clockText(r.offMinute) + (r.offMinute <= r.onMinute ? " (next day)" : "") + "</td>"
+              "<td><a class='b " + (r.enabled ? "on" : "") + "' href='/program/set?toggle=" + String(i) + "'>" + (r.enabled ? "Yes" : "No") + "</a></td>"
+              "<td><a class='b warn' href='/program/set?del=" + String(i) + "'>Delete</a></td></tr>";
+    }
+    form += "</table>";
+  }
+  form += "<h3>Add a rule</h3><form action='/program/set'>";
+  static const char *names[7] = { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+  for (int d = 0; d < 7; d++) form += String("<label><input type=checkbox name=d") + String(d) + " value=1> " + names[d] + "</label> ";
+  form += "<br>On: <input type=time name=on required> Off: <input type=time name=off required> <button class=b>Add</button>"
+          "<br><span class=dim>When the off time is earlier than the on time, the rule ends the next day. Up to " + String(SCHEDULE_MAX_RULES) + " rules; they may not overlap or touch.</span></form>";
+  sendPage(PAGE_PROGRAM, form);
+}
+// /program/set: add, delete or toggle a rule, or switch the whole program. Then back to the Program page.
+static void handleProgramSet() {
+  setWebStep("program edit");
+  if (g_webServer.hasArg("prog")) setProgramOn(g_webServer.arg("prog") == "1");   // the whole program (the add form uses "on" for the time)
+  if (g_webServer.hasArg("del") || g_webServer.hasArg("toggle")) {
+    int i = (g_webServer.hasArg("del") ? g_webServer.arg("del") : g_webServer.arg("toggle")).toInt();
+    if (i >= 0 && i < g_ruleCount) {
+      if (g_webServer.hasArg("del")) { for (int k = i; k < g_ruleCount - 1; k++) g_rules[k] = g_rules[k + 1]; g_ruleCount--; setWebMessage("Rule deleted"); }
+      else { g_rules[i].enabled = !g_rules[i].enabled; setWebMessage(g_rules[i].enabled ? "Rule switched on" : "Rule switched off"); }
+      saveProgramRules();
+    }
+  }
+  if (g_webServer.hasArg("off")) {                                                    // the add form
+    ScheduleRule r = { 0, 0, 0, true };
+    for (int d = 0; d < 7; d++) if (g_webServer.hasArg((String("d") + String(d)).c_str())) r.days |= (uint8_t)(1 << d);
+    int on = parseClockMinutes(g_webServer.arg("on")), off = parseClockMinutes(g_webServer.arg("off"));
+    if (on < 0 || off < 0) setWebMessage("Rule not added: " + String(ruleCheckText(RULE_BAD_TIME)));
+    else {
+      r.onMinute = (uint16_t) on; r.offMinute = (uint16_t) off;
+      RuleCheck check = scheduleCheckRule(g_rules, g_ruleCount, r, -1);
+      if (check == RULE_OK) { g_rules[g_ruleCount++] = r; saveProgramRules(); setWebMessage("Rule added"); logLine("program", "rule added: %s %s-%s", daysText(r.days).c_str(), clockText(on).c_str(), clockText(off).c_str()); }
+      else setWebMessage("Rule not added: " + String(ruleCheckText(check)));
+    }
+  }
+  g_webServer.sendHeader("Location", "/program"); g_webServer.send(303);
 }
 
 // Main page.
@@ -1995,6 +2158,15 @@ static void handleSettingsPage() {
           "Room temperature time-out: <input type=number name=tmo min=1 max=240 value=" + String(s.thermo.timeoutMinutes) + "> minutes"
           "<input type=hidden name=r value=settings> <button class=b>Save</button>"
           "<br><span class=dim>Fail-safe for the room sensor: when no room temperature has arrived for this long, the heater is switched off. It starts again by itself when a new value arrives.</span></form>";
+  static const struct { const char *value; const char *label; } zones[] = {
+    { "CET-1CEST,M3.5.0,M10.5.0/3", "Central Europe (Amsterdam, Berlin, Paris)" }, { "GMT0BST,M3.5.0/1,M10.5.0", "United Kingdom, Ireland (London)" },
+    { "WET0WEST,M3.5.0/1,M10.5.0", "Portugal (Lisbon)" }, { "EET-2EEST,M3.5.0/3,M10.5.0/4", "Eastern Europe (Helsinki, Athens)" }, { "UTC0", "UTC" } };
+  form += "<h3>Time zone</h3><form action='/set'><select name=tz>";
+  bool known = false;
+  for (const auto &z : zones) { bool on = !strcmp(z.value, g_timeZone); known |= on; form += String("<option value='") + z.value + "'" + (on ? " selected" : "") + ">" + z.label + "</option>"; }
+  form += String("</select><br>Or a TZ string: <input type=text name=tzcustom value='") + (known ? "" : htmlEscape(g_timeZone)) + "' maxlength=47 placeholder='e.g. CET-1CEST,M3.5.0,M10.5.0/3'>"
+          "<input type=hidden name=r value=settings> <button class=b>Save</button>"
+          "<br><span class=dim>Used by the weekly program and for the fireplace clock, with summer time. A TZ string filled in here wins over the list. Active now: " + htmlEscape(g_timeZone) + "</span></form>";
   form += "<h3>Factory reset</h3><p class=dim>Erases all settings (Wi-Fi, MQTT, fireplace, passkey and temperature control) and restarts the bridge in setup mode, like a physical reset button.</p>"
           "<a class='b warn' href='/reset'>Factory reset&hellip;</a>";
   sendPage(PAGE_SETTINGS, form);
@@ -2096,6 +2268,16 @@ static void handleSet() {
     stageThermostatSettings(values);                                                               // the BLE task validates and applies them
     queued &= queueCommand(CMD_APPLY_THERMOSTAT, 0, SOURCE_WEB);
   }
+  if (g_webServer.hasArg("tz")) {                                                                  // time zone form on the Settings page
+    String zone = g_webServer.arg("tzcustom"); zone.trim(); if (zone.length() == 0) zone = g_webServer.arg("tz");
+    bool valid = zone.length() >= 3 && zone.length() < sizeof(g_timeZone);
+    for (size_t i = 0; valid && i < zone.length(); i++) { char c = zone.c_str()[i]; valid = isalnum(c) || strchr("+-,./:<>_", c); }
+    if (valid) {
+      strlcpy(g_timeZone, zone.c_str(), sizeof(g_timeZone)); saveTimeZone(); setenv("TZ", g_timeZone, 1); tzset();
+      scheduleReset(g_scheduleState);                                                              // the clock jumped: no catch-up
+      setWebMessage("Time zone set to " + zone); logLine("cfg", "time zone %s", g_timeZone);
+    } else setWebMessage("Time zone not changed: not a valid TZ string");
+  }
   if (g_webServer.hasArg("flame"))  { int n = g_webServer.arg("flame").toInt(); n = n < 1 ? 1 : (n > 6 ? 6 : n); request(CMD_FLAME_LEVEL, n, AW_FLAME_LEVEL, n); }
   if (g_webServer.hasArg("sound"))  queued &= queueCommand(CMD_SET_HAS_SOUND, g_webServer.arg("sound") == "on" ? 1 : 0, SOURCE_WEB);
   if (g_webServer.hasArg("vol"))    { int n = g_webServer.arg("vol").toInt();   n = n < 0 ? 0 : (n > 6 ? 6 : n); request(CMD_VOLUME, n, AW_VOLUME, n); }
@@ -2151,7 +2333,7 @@ static void handleIcon512()       { sendStaticFile("image/png", (const char *) I
 
 // Register the page handlers and start the web server.
 static void startWebServer() {
-  g_webServer.on("/", handleMainPage); g_webServer.on("/settings", handleSettingsPage); g_webServer.on("/debug", handleDebugPage);
+  g_webServer.on("/", handleMainPage); g_webServer.on("/settings", handleSettingsPage); g_webServer.on("/program", handleProgramPage); g_webServer.on("/program/set", handleProgramSet); g_webServer.on("/debug", handleDebugPage);
   g_webServer.on("/reset", handleResetPage); g_webServer.on("/live", handleLive); g_webServer.on("/set", handleSet); g_webServer.on("/csv", handleCsv); g_webServer.on("/log", handleLog);
   g_webServer.on("/manifest.webmanifest", handleManifest); g_webServer.on("/sw.js", handleServiceWorker);
   g_webServer.on("/icon-192.png", handleIcon192); g_webServer.on("/icon-512.png", handleIcon512);
@@ -2309,8 +2491,8 @@ void loop() {
   lastPassUs = nowUs;
   checkWifiConnection();
   if (WiFi.status() == WL_CONNECTED) {
-    if (!g_ntpStarted) {            // Dutch time zone incl. summer time; change the TZ string if you live elsewhere
-      configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
+    if (!g_ntpStarted) {            // time zone from the Settings page (default: Dutch time incl. summer time)
+      configTzTime(g_timeZone, "pool.ntp.org", "time.google.com");
       g_ntpStarted = true;
     }
     if (!g_webStarted) {
@@ -2320,6 +2502,7 @@ void loop() {
       logLine("web", "control UI at http://dimplex-control.local/  (or http://%s/)", WiFi.localIP().toString().c_str());
       lastPassUs = 0; g_loopGapMaxUs = 0;     // do not count the one-time start-up work
     }
+    programTick();
     uint32_t startUs = micros();
     g_webServer.handleClient();
     uint32_t durationUs = micros() - startUs;
