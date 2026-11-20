@@ -140,7 +140,7 @@ All of these were constant in every observation unless noted, and their meaning 
 | 0x0020 | 0x1007 | 9x `00` | |
 | 0x0022 | 0x1008 | `00` | |
 | 0x0024 | 0x100d | `00` | Polled by the remote. **Watched** since 11 Nov (`24=`, CSV `reg0024`): a change could be a fault flag |
-| 0x0026 | 0x1011 | `00` | Was `35` (53) once, so not strictly constant: counter or measurement? **Watched** since 11 Nov (`26=`, CSV `reg0026`) |
+| 0x0026 | 0x1011 | `00`; `33` while the mist maker is dry | **Probably a "dry" flag set by the fireplace** (experiments.md section 11): `00` in about 10,000 readings, `33` in all of about 4,000 readings of the 14 h 45 min empty period on 18/19 Nov. It switches within 10 s of 0x003c falling to 3, together with the effect switching off (0x0063 = `0000`), stays `33` while the effect is off and returns to `00` 5 s after 0x003c is normal again. The meaning of the value `0x33` is not known (single flag or bit field); it was `35` once before. Plausible, one real run-out. **Watched** since 11 Nov (`26=`, CSV `reg0026`) |
 | 0x0030 | 0x1016 | `0010` | |
 | 0x0032 | 0x1017 | `0003` | |
 | 0x0036 | 0x1027 | `0000` | Polled by the remote. **Watched** since 11 Nov (`36=`, CSV `reg0036`): a change could be a fault flag |
@@ -184,14 +184,16 @@ All of these were constant in every observation unless noted, and their meaning 
 | Mode selection: timer / manual / frost protection | not found | Open |
 | °C / °F | 0x001c (?) | Unknown |
 | Adaptive Start, child lock | not found | Open |
-| Low water warning (two beeps) | 0x003c drops to 3; 0x0063 briefly 0 (effect off, about 150 W less); 0x0040 and 0x0014 do not change | Plausible (one test) |
+| Low water warning (two beeps) | 0x003c drops to 3; 0x0026 = `33`; 0x0063 goes to 0 (effect off, about 150 W less); 0x0040 and 0x0014 do not change. No level sensor: the mist maker itself detects "dry" | Plausible (one test, two real run-outs) |
 
 ## 10. Open questions
 
 - Mode selection (manual / timer / frost protection) and how the timer is switched on and off.
 - The daylight-saving flag in the clock (does it change when the clock is set in winter time?).
 - °C/°F and the meaning of 0x001c.
-- The meaning of 0x0053, 0x0051 and 0x0026, and the exact unit and threshold of 0x003c (what value counts as empty).
+- The meaning of 0x0053 and 0x0051, the bits of 0x0026 (value `33` when dry, `35` seen once: is it a bit field, and does it also show a missing tank?), and the exact unit and threshold of 0x003c (what value counts as empty).
+- Whether 0x0026 still reads `33` when the fireplace is switched off completely while dry (standby), and what it reads with the tank taken out.
+- Water consumption per hour for each flame level (so far one run at F1: at least 3 h 20 min per tank, experiments.md section 11).
 - Intensity values for F4 and F5 in 0x0063.
 - Behaviour of byte 2 of 0x0040 with an empty water tank.
 - Which measurement the fireplace uses internally for its thermostat.

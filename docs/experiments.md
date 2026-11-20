@@ -242,6 +242,36 @@ Source: Home Assistant history of the raw registers (older format `40 14 18 48 5
 
 **New registers (about 6 minutes, 29 rows, all in standby).** `0x0051` flips between `0100` and `0101` all the time **in standby, with the heater off**: it is therefore not the state of the heating element. `0x0026`, `0x0036` and `0x0024` stayed `00`, `0000` and `00`. A run with the heater on has not been logged yet.
 
+## 11. Run-out on 18 Nov with register 0x0026 (Home Assistant history, 18 to 19 Nov)
+
+Source: Home Assistant history export in UTC (about 35 hours, 14,410 rows of the raw registers `3c= 63= 51= 26= 36= 24=`, power meter, heater element, low water, room sensor, bridge diagnostics). Flame level F1 and heater power low did not change in the whole export (one row each at the start), so everything below is **F1, low power**. The tank was not measured; the filling times are known only from the log.
+
+| UTC | Event | 0x003c | 0x0063 | 0x0026 | Power |
+|---|---|---|---|---|---|
+| 18 Nov 11:43:11 | fireplace on (effect and heater) | `ffff`/`0000` | `0000` | `00` | 999 W |
+| 11:43:44 / 11:43:49 | effect starts (33 s and 38 s after the power rose) | about 980 | `0100`, then `003a` | `00` | about 1010 W |
+| 15:03:40 | **run-out** | **3** in one step, no decline before it (1091 to 1149 in the minutes before) | `003a` | `00` | 165 W to 155 W |
+| 15:03:50 | | 3 | **`0000`** | **`33`** | 0 W at 15:03:54 |
+| 15:03:50 to 05:48:23 | empty, 14 h 45 min | 3, sometimes 2 (89 readings) | `0000` | `33` (about 4,000 readings) | 0 W; the heater element still cycles at about 850 W |
+| 19 Nov 05:48:13 | water added | | | | 13 W |
+| 05:48:18 | | **back to 976** | `0000` | `33` | |
+| 05:48:23 | | about 1000 | `0000` | **`00`** | |
+| 05:48:24 | | | `0000` | `00` | **167 W** (the effect runs) |
+| 05:49:08 / 05:49:14 | | about 1000 | `0100`, then `003a` | `00` | 167 W |
+| 07:25:01 | fireplace off by hand | | `0000` | `00` | |
+
+- **The tank lasted at least 3 h 20 min at F1** (effect on from 11:43:44, dry at 15:03:40). It is a lower bound: the tank may not have been full at 11:43 (it was not logged when it was last filled).
+- **0x0026 is a dry flag.** It was `00` in every reading except in the single dry period (about 4,000 readings `33`, about 10,000 readings `00` otherwise), so no false positive in 35 hours. It switched at most 10 s after 0x003c fell to 3 (and in the same reading as 0x0063 going to 0) and went back to `00` 5 s after 0x003c returned to normal, so it follows the water and is not latched until a restart. It does not need the effect to be running: it stayed `33` for 14 hours with the effect off. **The meaning of the value `0x33` is not known**: it may be a single flag that happens to read `33`, or a bit field. It was `35` once before (register-map.md), so it is not a fixed constant either.
+- **Detection by the fireplace itself.** There is no level sensor in the tank, only the mist maker (confirmed by the owner). The fireplace tests the disc and sees "dry" as soon as it is not loaded; 0x0026 and the effect switch-off follow within seconds. Nothing in the log announces an empty tank beforehand: neither 0x003c (no trend) nor the power (flat at 165 W until the step).
+- **The heater keeps running with an empty tank** (once the thermostat calls for heat: 9 heating periods of about 11 minutes each during the dry night, starting every 34 to 55 minutes, at about 850 W). Only the mist and flames stop.
+- **The fireplace tests again by itself.** While it is dry 0x003c keeps reading 3 (sometimes 2), so the unit keeps probing the disc. The effect restarts on its own after refilling; about 10 s pass between pouring the water (13 W at 05:48:13) and the effect power (167 W at 05:48:24), which matches what the owner sees (a few seconds before the light effect comes back).
+- **0x0063 and the power meter disagree at the start by 30 to 45 s.** The power rises when the effect starts, 0x0063 follows `0100` about 33 s (11:43) and 44 s (05:49) later; at switch-off 0x0063 follows within one reading. For "is the effect really running" the power meter is faster than 0x0063.
+- **Low water sensor flap at 21:25.** `binary_sensor.low_water` went off at 21:25:02 and on again at 21:25:43 while 0x0026 stayed `33` and 0x003c stayed 3. Most likely this is the designed reset on a Bluetooth disconnect (design.md section 5.6; the export has no Bluetooth connection counter to confirm it): after the reconnect the 20 s start-up grace plus the 10 s dry hold plus the reconnect time add up to the 41 s seen. The flap would not have happened if the state were kept over a link loss, or if 0x0026 were used as a second signal.
+- **Register 0x0051** keeps flipping between `0100` and `0101` with the effect on, off and dry, so it is still not a water or heater signal; 0x0036 and 0x0024 stayed `0000` and `00` in the whole run, also during the dry period and with the heater cycling, so they are not dry flags and not fault flags for heater cycling.
+- **Warm-up of 0x003c** again: 987 to 1119 in the first 2.5 h of the 18 Nov run (about 1000, 1040, 1080, 1107 and 1119 per 30 min) and 966 to 1099 in the 19 Nov run (96 min), the same curve as in section 10.
+
+**Bridge memory (diagnostic sensors in the export).** Free stack of the BLE task: 5792 B at the start of the export, then 5744, 5680 and 5648 B after the three heating periods at 01:11, 03:11 and 05:23 on 19 Nov (it only falls when a deeper code path is run for the first time; 144 B in 35 h, flattening). Free stack of the MQTT task: 5452 B, unchanged. **Lowest free heap: 5128 B, unchanged in 35 h.** The stacks are comfortable (about 70 % and 67 % free of 8 kB). The 5 kB lowest free heap is low in absolute terms, but it did not move in 35 hours of heating cycles, a dry period, a refill and BLE reconnects, so there is no leak visible in it. It probably comes from the start-up (Wi-Fi, BLE, TLS or the portal) and was reached before the export began. The current free heap, the restart count and the uptime are not in this export, so the margin and any restart cannot be judged from it.
+
 ## 8. Home Assistant history of 19 Oct (bridge via MQTT, power meter, room sensor)
 
 Source: a Home Assistant history export (times below are local time, UTC+2). Entities: the bridge's switches and sensors, a power meter on the fireplace socket and a separate Bluetooth room thermometer.
