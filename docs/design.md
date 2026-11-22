@@ -162,7 +162,7 @@ Served by the Arduino `WebServer` on port 80 from `loop()`.
 
 | Path | Purpose |
 |---|---|
-| `/` | Main page: Bluetooth link, flame effect, volume (only with the sound setting), heating, setpoint, thermostat status, room temperature (room sensor mode), internal temperature |
+| `/` | Main page: Bluetooth link (with the last connect error while connecting), flame effect, volume (only with the sound setting), heating, setpoint, thermostat status, room temperature (room sensor mode), internal temperature |
 | `/settings` | Settings page: flame level, heater power, temperature control mode with margins and time-out, "My fireplace has sound" setting, fireplace selection (scan, address, passkey), factory reset |
 | `/debug` | Debug page: the registers that are not understood yet (`0x003c`, `0x0063`, and the watched `0x0051`, `0x0026`, `0x0036`, `0x0024`), temperature history, CSV download, system information, restart |
 | `/live?p=<page>` | Only the live block of a page (HTML fragment); polled by the page script |
@@ -434,7 +434,7 @@ sequenceDiagram
     M->>M: publish all values to MQTT
 ```
 
-**When connecting fails.** The log gets three short lines (a line in the restart-proof log is at most 95 characters): `connect failed after <n> ms, error <code> (0x<hex>)`, the meaning of that code, and the target (address, where it came from: *pinned in Settings*, *remembered* or *auto-detected*, and whether a scan is running). The code is `getLastError()` of the NimBLE client: below 0x200 it is a host error (for example 2 = already connecting, 3 = invalid address, 6 = out of memory, 13 = timeout, 15 = radio busy), from 0x200 on it is a controller (HCI) error (0x23e = connection could not be established). A failure after a few milliseconds instead of the 5 s timeout means the attempt was refused locally (address, busy radio, stack), not that the fireplace did not answer.
+**When connecting fails.** The log gets three short lines (a line in the restart-proof log is at most 95 characters): `connect failed after <n> ms, error <code> (0x<hex>)`, the meaning of that code, and the target (address, where it came from: *pinned in Settings*, *remembered* or *auto-detected*, and whether a scan is running). The code is `getLastError()` of the NimBLE client: below 0x200 it is a host error (for example 2 = already connecting, 3 = invalid address, 6 = out of memory, 13 = timeout, 15 = radio busy), from 0x200 on it is a controller (HCI) error (0x23e = connection could not be established). The Main page shows the same code under the Bluetooth status while the bridge is connecting (`Last attempt failed (<n>x since the last success): error ..., meaning`); the counter is reset when the connection is ready. A failure after a few milliseconds instead of the 5 s timeout means the attempt was refused locally (address, busy radio, stack), not that the fireplace did not answer.
 
 ### 6.3 A command from the web page
 
