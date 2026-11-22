@@ -185,6 +185,7 @@ struct SharedState {
   uint8_t regControl[2], regHeater[2], regHeaterPower, flameLevel, volume, regTemperature[3], regUnknown3c[3], regUnknown63[2];
   uint8_t regExtra51[2], regExtra26, regExtra36[2], regExtra24;   // registers we only watch (not understood yet)
   bool lowWater;                             // the mist maker is dry (waterwatch.h)
+  int connectFailures, connectError;         // failed connect attempts since the last success, and the error code of the last one
   FireplaceIdent ident;                      // model, firmware, serial (kept after a disconnect)
   bool hasSound;                             // setting: this fireplace has a sound effect (Volume and Sound are offered)
   int setpoint, setpointMin, setpointMax;
@@ -423,6 +424,7 @@ static uint8_t g_regTemperature[3] = {0, 0, 0}, g_regUnknown3c[3] = {0, 0, 0}, g
 static uint8_t g_regExtra51[2] = {0, 0}, g_regExtra26 = 0, g_regExtra36[2] = {0, 0}, g_regExtra24 = 0;   // watched only: 0x0051, 0x0026, 0x0036, 0x0024
 static uint8_t g_flameLevel = 0, g_volume = 0;
 static FireplaceIdent g_ident = {};               // written by bleTask
+static volatile int g_connectFailures = 0, g_connectError = 0;   // bleTask writes; shown on the Main page while connecting
 static volatile bool g_hasSound = false;          // flash key "sound": Volume and Sound are only offered when this is set (default off)
 static WaterWatch g_waterWatch = {};            // low water detection on 0x003c (bleTask only)
 static int g_setpoint = 0;                      // 0x0018 (0 while the heater is off)
@@ -470,7 +472,7 @@ static void publishSnapshot() {
   memcpy(s.regControl, g_regControl, 2); memcpy(s.regHeater, g_regHeater, 2); memcpy(s.regTemperature, g_regTemperature, 3);
   memcpy(s.regUnknown3c, g_regUnknown3c, 3); memcpy(s.regUnknown63, g_regUnknown63, 2);
   memcpy(s.regExtra51, g_regExtra51, 2); s.regExtra26 = g_regExtra26; memcpy(s.regExtra36, g_regExtra36, 2); s.regExtra24 = g_regExtra24; s.lowWater = g_waterWatch.lowWater;
-  s.regHeaterPower = g_regHeaterPower; s.flameLevel = g_flameLevel; s.volume = g_volume; s.ident = g_ident; s.hasSound = g_hasSound; s.setpoint = g_setpoint;
+  s.regHeaterPower = g_regHeaterPower; s.flameLevel = g_flameLevel; s.volume = g_volume; s.ident = g_ident; s.hasSound = g_hasSound; s.connectFailures = g_connectFailures; s.connectError = g_connectError; s.setpoint = g_setpoint;
   strlcpy(s.configuredAddress, cfg_fireplaceAddress, sizeof(s.configuredAddress)); strlcpy(s.passkeyText, cfg_passkeyText, sizeof(s.passkeyText));
   memcpy(s.scan, g_scanEntries, sizeof(g_scanEntries)); s.scanCount = g_scanCount; s.scanning = g_scanning; s.scanFinishedMs = g_scanFinishedMs;
   s.setpointMin = g_setpointMin; s.setpointMax = g_setpointMax; s.lastReadMs = g_lastReadMs;
@@ -774,6 +776,7 @@ static void bleConnectToFireplace() {
   uint32_t connectStartMs = millis();
   if (!g_bleClient->connect(g_targetAddress)) {
     int err = g_bleClient->getLastError();
+    g_connectError = err; g_connectFailures = g_connectFailures + 1;
     // Three short lines: a line in the restart-proof log (and so on the Debug page) is only LOG_RING_LINE_LENGTH characters long.
     logLine("ble", "connect failed after %lu ms, error %d (0x%x)", (unsigned long)(millis() - connectStartMs), err, err);
     logLine("ble", "  %s", bleErrorText(err));
@@ -1256,7 +1259,7 @@ static void bleTask(void *) {
       setBleStep("finding the registers");
       bool found = findFireplaceCharacteristics();         // takes seconds; the link can drop meanwhile
       if (found && g_bleConnected && g_blePaired) {
-        g_bleReady = true;
+        g_bleReady = true; g_connectFailures = 0;
         setBleStep("handshake and first read");
         sendInitSequence();
         readFireplaceState();
@@ -1808,7 +1811,11 @@ static String buildMainLive(const SharedState &s) {
   h += "<p class=dim>";
   if (!s.bleEnabled)  h += "Released: the original remote can connect. Values below are the last known.";
   else if (s.ready)   h += "Connected and paired to the fireplace.";
-  else                h += "Connecting to the fireplace&hellip;";
+  else {
+    h += "Connecting to the fireplace&hellip;";
+    if (s.connectFailures > 0)                           // why the last attempt failed (the Debug page log has the details)
+      h += String("<br>Last attempt failed (") + String(s.connectFailures) + "x since the last success): error " + String(s.connectError) + " (0x" + String(s.connectError, HEX) + "), " + bleErrorText(s.connectError);
+  }
   h += "</p>";
 
   h += "<h3>Flame effect</h3>" + choiceButton("On", setHref("fx=on"), effectOn, AW_EFFECT, 1) + choiceButton("Off (all off)", setHref("fx=off"), ready && !effectOn, AW_EFFECT, 0);

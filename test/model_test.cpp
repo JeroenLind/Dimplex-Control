@@ -65,6 +65,8 @@ int main() {
   CK(log.find("error 574 (0x23e)") != std::string::npos && log.find("not reachable, or busy with another central") != std::string::npos);
   CK(log.find("target 24:6f:28:aa:bb:cc (pinned in Settings), scanning=0") != std::string::npos);
   for (int i = 0; i < g_rtcLog.count; i++) CK(strlen(g_rtcLog.lines[i]) < LOG_RING_LINE_LENGTH - 1);   // nothing is cut off
+  publishSnapshot(); g_bleEnabled = true; handleMainPage();                                              // and the Main page shows it while connecting
+  CK(g_webServer.lastBody.find("Last attempt failed (1x since the last success): error 574 (0x23e)") != std::string::npos);
   CK(bleErrorText(2) != nullptr && !strcmp(bleErrorText(0), "no error recorded") && strlen(bleErrorText(15)) < 60);
   printf("model test: %d failed\n", fails); return fails;
 }
