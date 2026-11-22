@@ -105,7 +105,8 @@ static inline uint32_t uxTaskGetStackHighWaterMark(void *) { return 4000; }
 typedef enum { ESP_RST_UNKNOWN, ESP_RST_POWERON, ESP_RST_EXT, ESP_RST_SW, ESP_RST_PANIC, ESP_RST_INT_WDT, ESP_RST_TASK_WDT, ESP_RST_WDT, ESP_RST_DEEPSLEEP, ESP_RST_BROWNOUT } esp_reset_reason_t;
 static inline esp_reset_reason_t esp_reset_reason() { return ESP_RST_POWERON; }
 static inline int64_t esp_timer_get_time() { return (int64_t) g_simMillis * 1000; }
-struct EspStub { void restart() { extern int g_simRestarts; g_simRestarts++; } uint32_t getFreeHeap() { return 150000; } uint32_t getMinFreeHeap() { return 120000; } };
+struct EspStub { void restart() { extern int g_simRestarts; g_simRestarts++; } uint32_t getFreeHeap() { return 150000; } uint32_t getMinFreeHeap() { return 120000; } const char *getChipModel() { return "ESP32-STUB"; } int getChipRevision() { return 3; } int getCpuFreqMHz() { return 240; } };
+static inline const char *esp_get_idf_version() { return "v0.0-stub"; }
 extern EspStub ESP;
 #define ESP_PWR_LVL_P9 9
 #define BLE_HS_IO_KEYBOARD_DISPLAY 4

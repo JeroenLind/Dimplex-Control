@@ -164,7 +164,7 @@ Served by the Arduino `WebServer` on port 80 from `loop()`.
 |---|---|
 | `/` | Main page: Bluetooth link (with the last connect error while connecting), flame effect, volume (only with the sound setting), heating, setpoint, thermostat status, room temperature (room sensor mode), internal temperature |
 | `/settings` | Settings page: flame level, heater power, temperature control mode with margins and time-out, "My fireplace has sound" setting, fireplace selection (scan, address, passkey), factory reset |
-| `/debug` | Debug page: the registers that are not understood yet (`0x003c`, `0x0063`, and the watched `0x0051`, `0x0026`, `0x0036`, `0x0024`), temperature history, CSV download, system information, restart |
+| `/debug` | Debug page: the registers that are not understood yet (`0x003c`, `0x0063`, and the watched `0x0051`, `0x0026`, `0x0036`, `0x0024`), temperature history, CSV download, versions (ESP32 board package, ESP-IDF, NimBLE-Arduino, chip and build time; also logged at boot, PubSubClient and WiFiManager have no version macro), system information, restart |
 | `/live?p=<page>` | Only the live block of a page (HTML fragment); polled by the page script |
 | `/set?...` | Actions. Parameters: `ctl=fireplace/room/internal` (temperature control mode), `xoff`, `xon`, `ioff`, `ion` (margins in degrees) with `tmo` (time-out in minutes), `ble=on/off`, `fx=on/off`, `heater=on/off`, `hpwr=low/high`, `sp=<deg>`, `spd=<+/-1>`, `flame=1..6`, `vol=0..6`, `scan=1`, `fpaddr=<mac or auto>`, `pkey=<digits>`, `diag=reset`, `restart=1`, `factory=confirm`, plus `r=<page>` for the page to return to |
 | `/reset` | Confirmation page for the factory reset |

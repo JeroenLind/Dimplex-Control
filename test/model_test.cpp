@@ -68,5 +68,6 @@ int main() {
   publishSnapshot(); g_bleEnabled = true; handleMainPage();                                              // and the Main page shows it while connecting
   CK(g_webServer.lastBody.find("Last attempt failed (1x since the last success): error 574 (0x23e)") != std::string::npos);
   CK(bleErrorText(2) != nullptr && !strcmp(bleErrorText(0), "no error recorded") && strlen(bleErrorText(15)) < 60);
+  handleDebugPage(); CK(g_webServer.lastBody.find("<h3>Versions</h3>") != std::string::npos && g_webServer.lastBody.find("NimBLE-Arduino ") != std::string::npos && g_webServer.lastBody.find("ESP32-STUB rev 3") != std::string::npos);
   printf("model test: %d failed\n", fails); return fails;
 }

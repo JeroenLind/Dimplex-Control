@@ -57,6 +57,12 @@
 #include <esp_timer.h>       // esp_timer_get_time()
 #include "icons.h"           // app icons for "install on the phone" (second tab in the Arduino IDE)
 #include "thermostat.h"      // temperature control types and decision logic (third tab; plain C++, tested on a PC)
+#if __has_include(<esp_arduino_version.h>)
+#include <esp_arduino_version.h>   // ESP_ARDUINO_VERSION_STR: version of the ESP32 board package (core), for the version log
+#endif
+#if __has_include(<NimBLECppVersion.h>)
+#include <NimBLECppVersion.h>      // NIMBLE_CPP_VERSION_MAJOR/MINOR/PATCH: version of the NimBLE-Arduino library
+#endif
 #include "waterwatch.h"      // low water detection on register 0x003c (plain C++, tested on a PC)
 
 // =====================================================================================================
@@ -726,6 +732,25 @@ static void buildPortalScanList() {
   strlcpy(g_portalScanHtml, html.c_str(), sizeof(g_portalScanHtml));
   logLine("ble", "scan found %d fireplace(s)", count);
 }
+
+// Versions this sketch was built with and runs on, for the Debug page and the boot log. Libraries that have no version macro
+// (PubSubClient, WiFiManager) cannot be read at run time: look them up in the Library Manager.
+static String versionText() {
+  String t = "Arduino-ESP32 core ";
+#ifdef ESP_ARDUINO_VERSION_STR
+  t += ESP_ARDUINO_VERSION_STR;
+#else
+  t += "unknown";
+#endif
+  t += String(" &middot; ESP-IDF ") + esp_get_idf_version() + " &middot; NimBLE-Arduino ";
+#ifdef NIMBLE_CPP_VERSION_MAJOR
+  t += String(NIMBLE_CPP_VERSION_MAJOR) + "." + String(NIMBLE_CPP_VERSION_MINOR) + "." + String(NIMBLE_CPP_VERSION_PATCH);
+#else
+  t += "unknown (older than 2.0?)";
+#endif
+  return t;
+}
+static String chipText() { return String(ESP.getChipModel()) + " rev " + String(ESP.getChipRevision()) + ", " + String(ESP.getCpuFreqMHz()) + " MHz &middot; built " + __DATE__ + " " + __TIME__; }
 
 // Text for the error codes of the NimBLE host that connect() can leave in getLastError(). 0x200 + x is the HCI error x of the controller.
 static const char *bleErrorText(int code) {
@@ -1945,6 +1970,7 @@ static String buildDebugLive(const SharedState &s, uint32_t pending) {
   h += "<h3>Connections</h3><p class=dim>Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "not connected") +
        " &middot; MQTT: " + (g_mqttUp ? "connected" : "<b>not connected</b>") + " (" + String((uint32_t) g_mqttFailCount) + " failed attempts)" +
        " &middot; Bluetooth: " + (s.ready ? "ready" : (s.connected ? "connected, pairing" : (s.bleEnabled ? "connecting" : "released"))) + "</p>";
+  h += "<h3>Versions</h3><p class=dim>" + versionText() + "<br>" + chipText() + "<br>PubSubClient and WiFiManager have no version at run time: see the Library Manager.</p>";
   h += "<h3>System</h3><p class=dim>Commands waiting: " + String(pending);
   if (g_commandsDropped) h += " &middot; dropped (queue full): " + String((uint32_t) g_commandsDropped);
   h += "<br>Longest gap between two loop() passes: " + formatMs(g_loopGapMaxUs) + " &middot; longest web request: " + formatMs(g_webRequestMaxUs) +
@@ -2268,6 +2294,7 @@ void setup() {
   startDiagnosticsSession();               // saves the previous session's log and starts a new one (before the first log line)
   logLine("boot", "Dimplex Control bridge (NimBLE + setup portal, task layout) starting...");
   logLine("boot", "start #%lu, reason: %s", (unsigned long) g_bootCount, g_restartReason);
+  { String v = versionText(); v.replace("&middot;", "|"); logLine("boot", "%s", v.c_str()); String c = chipText(); c.replace("&middot;", "|"); logLine("boot", "%s", c.c_str()); }
 
   g_commandQueue = xQueueCreate(8, sizeof(Command));
   g_snapshotMutex = xSemaphoreCreateMutex();
