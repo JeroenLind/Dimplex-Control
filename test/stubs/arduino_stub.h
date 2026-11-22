@@ -241,9 +241,11 @@ struct NimBLEClient {
   NimBLEClientCallbacks *cb = nullptr; bool connectedFlag = false;
   NimBLERemoteService service;
   NimBLEClient();
+  int lastError = 0; int getLastError() const { return lastError; }
   void setClientCallbacks(NimBLEClientCallbacks *c, bool) { cb = c; }
   void setConnectTimeout(int) {}
-  bool connect(const NimBLEAddress &) { connectedFlag = true; if (cb) cb->onConnect(this); return true; }
+  bool failConnect = false;
+  bool connect(const NimBLEAddress &) { if (failConnect) return false; connectedFlag = true; if (cb) cb->onConnect(this); return true; }
   bool secureConnection() { return true; }
   bool isConnected() { return connectedFlag; }
   void disconnect() { connectedFlag = false; if (cb) cb->onDisconnect(this, 0); }
@@ -251,7 +253,7 @@ struct NimBLEClient {
 };
 struct NimBLEAdvertisedDevice { std::string getName() const { return ""; } NimBLEAddress getAddress() const { return NimBLEAddress(); } int getRSSI() const { return 0; } };
 struct NimBLEScanResults { int getCount() const { return 0; } const NimBLEAdvertisedDevice *getDevice(int) const { return nullptr; } };
-struct NimBLEScan { void setActiveScan(bool) {} NimBLEScanResults getResults(int, bool) { return NimBLEScanResults(); } void clearResults() {} };
+struct NimBLEScan { bool isScanning() { return false; } void setActiveScan(bool) {} NimBLEScanResults getResults(int, bool) { return NimBLEScanResults(); } void clearResults() {} };
 struct NimBLEDevice {
   static void init(const char *) {} static void setPower(int) {} static void setSecurityAuth(bool, bool, bool) {} static void setSecurityIOCap(int) {}
   static NimBLEClient *createClient() { return new NimBLEClient(); }

@@ -56,5 +56,15 @@ int main() {
   g_hasSound = false; publishSnapshot(); handleMainPage(); CK(g_webServer.lastBody.find("<h3>Volume</h3>") == std::string::npos);
   handleSettingsPage(); CK(g_webServer.lastBody.find("My fireplace has a sound effect") != std::string::npos);   // the setting itself is always there
   handleDebugPage(); CK(g_webServer.lastBody.find("EP4120") != std::string::npos && g_webServer.lastBody.find("F000B5E0") != std::string::npos && g_webServer.lastBody.find("0x76 / 0x87") != std::string::npos);
+  // A failed connect logs the error code, its meaning and the target, in lines that fit the restart-proof log
+  g_rtcLog.magic = RTC_LOG_MAGIC; g_rtcLog.head = 0; g_rtcLog.count = 0;
+  g_bleConnected = false; g_haveTarget = false; strlcpy(cfg_fireplaceAddress, "24:6f:28:aa:bb:cc", sizeof(cfg_fireplaceAddress));
+  g_bleClient->failConnect = true; g_bleClient->lastError = 0x23e;
+  bleConnectToFireplace();
+  std::string log; for (int i = 0; i < g_rtcLog.count; i++) { log += g_rtcLog.lines[i]; log += "\n"; }
+  CK(log.find("error 574 (0x23e)") != std::string::npos && log.find("not reachable, or busy with another central") != std::string::npos);
+  CK(log.find("target 24:6f:28:aa:bb:cc (pinned in Settings), scanning=0") != std::string::npos);
+  for (int i = 0; i < g_rtcLog.count; i++) CK(strlen(g_rtcLog.lines[i]) < LOG_RING_LINE_LENGTH - 1);   // nothing is cut off
+  CK(bleErrorText(2) != nullptr && !strcmp(bleErrorText(0), "no error recorded") && strlen(bleErrorText(15)) < 60);
   printf("model test: %d failed\n", fails); return fails;
 }

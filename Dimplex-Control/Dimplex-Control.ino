@@ -725,6 +725,28 @@ static void buildPortalScanList() {
   logLine("ble", "scan found %d fireplace(s)", count);
 }
 
+// Text for the error codes of the NimBLE host that connect() can leave in getLastError(). 0x200 + x is the HCI error x of the controller.
+static const char *bleErrorText(int code) {
+  switch (code) {
+    case 0:  return "no error recorded";
+    case 2:  return "already connecting or connected";
+    case 3:  return "invalid parameter or address";
+    case 6:  return "out of memory";
+    case 7:  return "not connected";
+    case 13: return "timeout";
+    case 15: return "radio busy (scan or connect running)";
+    case 18: return "wrong role";
+    case 21: return "no usable own address";
+    case 22: return "Bluetooth stack not synced";
+    case 0x23e: return "not reachable, or busy with another central";
+    case 0x208: return "connection timeout";
+    case 0x216: return "terminated by the remote side";
+    case 0x213: return "remote user terminated";
+    default: return code >= 0x200 && code < 0x300 ? "controller (HCI) error" : "see NimBLE ble_hs.h";
+  }
+}
+static const char *g_targetSource = "";        // where the target address came from, for the log: pinned, remembered, auto-detected
+
 // One connect attempt: decide which fireplace (pinned address, remembered address or a scan), connect and pair.
 // May block for seconds (scan 4 s, connect timeout 5 s); that is fine because only bleTask waits.
 static void bleConnectToFireplace() {
@@ -737,20 +759,25 @@ static void bleConnectToFireplace() {
   }
   if (!g_haveTarget) {
     if (strlen(cfg_fireplaceAddress) >= 17) {       // pinned address from the portal
-      g_targetAddress = NimBLEAddress(cfg_fireplaceAddress, BLE_ADDR_PUBLIC); g_haveTarget = true;
+      g_targetAddress = NimBLEAddress(cfg_fireplaceAddress, BLE_ADDR_PUBLIC); g_haveTarget = true; g_targetSource = "pinned in Settings";
     } else if (strlen(g_detectedAddress) >= 17) {   // remembered from a previous auto-detect
-      g_targetAddress = NimBLEAddress(g_detectedAddress, BLE_ADDR_PUBLIC); g_haveTarget = true;
+      g_targetAddress = NimBLEAddress(g_detectedAddress, BLE_ADDR_PUBLIC); g_haveTarget = true; g_targetSource = "remembered";
       logLine("ble", "using remembered fireplace %s", g_detectedAddress);
     } else if (scanForFireplace(g_targetAddress)) { // fresh auto-detect by name
-      g_haveTarget = true;
+      g_haveTarget = true; g_targetSource = "auto-detected";
       rememberDetectedAddress(g_targetAddress.toString().c_str());
       logLine("ble", "auto-detected fireplace %s (remembered)", g_detectedAddress);
     } else {
       logLine("ble", "no fireplace found in scan (will retry)"); return;
     }
   }
+  uint32_t connectStartMs = millis();
   if (!g_bleClient->connect(g_targetAddress)) {
-    logLine("ble", "connect failed");
+    int err = g_bleClient->getLastError();
+    // Three short lines: a line in the restart-proof log (and so on the Debug page) is only LOG_RING_LINE_LENGTH characters long.
+    logLine("ble", "connect failed after %lu ms, error %d (0x%x)", (unsigned long)(millis() - connectStartMs), err, err);
+    logLine("ble", "  %s", bleErrorText(err));
+    logLine("ble", "  target %s (%s), scanning=%d", g_targetAddress.toString().c_str(), g_targetSource, (int) NimBLEDevice::getScan()->isScanning());
     if (!strlen(cfg_fireplaceAddress)) {            // auto mode: forget the target (and a remembered address) and re-scan
       g_haveTarget = false;
       if (strlen(g_detectedAddress)) { logLine("ble", "forgetting remembered address; will re-scan"); rememberDetectedAddress(nullptr); }

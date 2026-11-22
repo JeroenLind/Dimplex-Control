@@ -434,6 +434,8 @@ sequenceDiagram
     M->>M: publish all values to MQTT
 ```
 
+**When connecting fails.** The log gets three short lines (a line in the restart-proof log is at most 95 characters): `connect failed after <n> ms, error <code> (0x<hex>)`, the meaning of that code, and the target (address, where it came from: *pinned in Settings*, *remembered* or *auto-detected*, and whether a scan is running). The code is `getLastError()` of the NimBLE client: below 0x200 it is a host error (for example 2 = already connecting, 3 = invalid address, 6 = out of memory, 13 = timeout, 15 = radio busy), from 0x200 on it is a controller (HCI) error (0x23e = connection could not be established). A failure after a few milliseconds instead of the 5 s timeout means the attempt was refused locally (address, busy radio, stack), not that the fireplace did not answer.
+
 ### 6.3 A command from the web page
 
 ```mermaid
