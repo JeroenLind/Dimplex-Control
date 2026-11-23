@@ -6,6 +6,8 @@
  *
  * A rule has weekdays (bit 0 = Monday ... bit 6 = Sunday), an on time and an off time in minutes since midnight. When the off time
  * is not later than the on time the rule crosses midnight: it is on until the off time of the NEXT day.
+ * A rule with onMinute == SCHEDULE_NO_TIME is an "off only" rule: at its off time everything is switched off, but only when the
+ * fireplace is on (SCHED_OFF_IF_ON). It occupies that single minute in the overlap check.
  */
 #pragma once
 #include <stdint.h>
@@ -13,13 +15,14 @@
 
 #define SCHEDULE_MAX_RULES   20
 #define SCHEDULE_MAX_GAP     10          // handle at most this many missed minutes (a bigger jump is a clock change: no catch-up)
+#define SCHEDULE_NO_TIME     0xFFFF      // onMinute of an "off only" rule
 #define SCHEDULE_WEEK_MIN    10080
 #define SCHEDULE_RECORD_SIZE 6           // bytes per rule in flash
 #define SCHEDULE_BLOB_SIZE   (1 + SCHEDULE_MAX_RULES * SCHEDULE_RECORD_SIZE)
 
 struct ScheduleRule { uint8_t days; uint16_t onMinute; uint16_t offMinute; bool enabled; };
 
-enum ScheduleAction : uint8_t { SCHED_NONE = 0, SCHED_ON = 1, SCHED_OFF = 2 };
+enum ScheduleAction : uint8_t { SCHED_NONE = 0, SCHED_ON = 1, SCHED_OFF = 2, SCHED_OFF_IF_ON = 3 };
 enum RuleCheck : uint8_t { RULE_OK, RULE_NO_DAY, RULE_BAD_TIME, RULE_SAME_TIME, RULE_OVERLAP, RULE_FULL };
 
 static inline const char *ruleCheckText(RuleCheck r) {
@@ -34,8 +37,14 @@ static inline const char *ruleCheckText(RuleCheck r) {
   return "?";
 }
 
-// Length in minutes of one switched-on period of the rule (1 to 1439).
-static inline int scheduleRuleLength(const ScheduleRule &r) { return r.offMinute > r.onMinute ? r.offMinute - r.onMinute : r.offMinute + 1440 - r.onMinute; }
+static inline bool scheduleOffOnly(const ScheduleRule &r) { return r.onMinute == SCHEDULE_NO_TIME; }
+// Length in minutes of one switched-on period of the rule (1 to 1439); 0 for an off-only rule (one single minute).
+static inline int scheduleRuleLength(const ScheduleRule &r) {
+  if (scheduleOffOnly(r)) return 0;
+  return r.offMinute > r.onMinute ? r.offMinute - r.onMinute : r.offMinute + 1440 - r.onMinute;
+}
+// First minute a rule occupies: its on minute, or for an off-only rule its off minute.
+static inline int scheduleRuleStart(const ScheduleRule &r) { return scheduleOffOnly(r) ? r.offMinute : r.onMinute; }
 
 // Mark every minute a rule occupies in a week, both its on minute and its off minute included (so rules that touch conflict).
 typedef uint8_t ScheduleWeek[(SCHEDULE_WEEK_MIN + 7) / 8];
@@ -43,14 +52,14 @@ static inline void scheduleMark(ScheduleWeek w, const ScheduleRule &r) {
   int len = scheduleRuleLength(r);
   for (int d = 0; d < 7; d++) {
     if (!(r.days & (1 << d))) continue;
-    for (int m = 0; m <= len; m++) { int i = (d * 1440 + r.onMinute + m) % SCHEDULE_WEEK_MIN; w[i >> 3] |= (uint8_t)(1 << (i & 7)); }
+    for (int m = 0; m <= len; m++) { int i = (d * 1440 + scheduleRuleStart(r) + m) % SCHEDULE_WEEK_MIN; w[i >> 3] |= (uint8_t)(1 << (i & 7)); }
   }
 }
 static inline bool scheduleOverlaps(const ScheduleWeek w, const ScheduleRule &r) {
   int len = scheduleRuleLength(r);
   for (int d = 0; d < 7; d++) {
     if (!(r.days & (1 << d))) continue;
-    for (int m = 0; m <= len; m++) { int i = (d * 1440 + r.onMinute + m) % SCHEDULE_WEEK_MIN; if (w[i >> 3] & (1 << (i & 7))) return true; }
+    for (int m = 0; m <= len; m++) { int i = (d * 1440 + scheduleRuleStart(r) + m) % SCHEDULE_WEEK_MIN; if (w[i >> 3] & (1 << (i & 7))) return true; }
   }
   return false;
 }
@@ -58,8 +67,8 @@ static inline bool scheduleOverlaps(const ScheduleWeek w, const ScheduleRule &r)
 // Is the rule valid on its own, and does it fit with the other rules? skip = index of the rule being replaced (-1 for a new rule).
 static inline RuleCheck scheduleCheckRule(const ScheduleRule *rules, int count, const ScheduleRule &cand, int skip) {
   if ((cand.days & 0x7f) == 0 || (cand.days & 0x80)) return (cand.days & 0x80) ? RULE_BAD_TIME : RULE_NO_DAY;
-  if (cand.onMinute > 1439 || cand.offMinute > 1439) return RULE_BAD_TIME;
-  if (cand.onMinute == cand.offMinute) return RULE_SAME_TIME;
+  if ((cand.onMinute > 1439 && !scheduleOffOnly(cand)) || cand.offMinute > 1439) return RULE_BAD_TIME;
+  if (!scheduleOffOnly(cand) && cand.onMinute == cand.offMinute) return RULE_SAME_TIME;
   if (skip < 0 && count >= SCHEDULE_MAX_RULES) return RULE_FULL;
   ScheduleWeek w; memset(w, 0, sizeof(w));
   for (int i = 0; i < count; i++) if (i != skip) scheduleMark(w, rules[i]);     // disabled rules count too
@@ -108,8 +117,8 @@ static inline ScheduleAction scheduleAtMinute(const ScheduleRule *rules, int cou
     const ScheduleRule &r = rules[i];
     if (!r.enabled) continue;
     if ((r.days & (1 << weekday)) && r.onMinute == minute) a = SCHED_ON;
-    int offDay = r.offMinute > r.onMinute ? weekday : (weekday + 6) % 7;              // a rule over midnight ends the day after its day
-    if ((r.days & (1 << offDay)) && r.offMinute == minute) a = SCHED_OFF;
+    int offDay = (scheduleOffOnly(r) || r.offMinute > r.onMinute) ? weekday : (weekday + 6) % 7;   // a rule over midnight ends the day after its day
+    if ((r.days & (1 << offDay)) && r.offMinute == minute) a = scheduleOffOnly(r) ? SCHED_OFF_IF_ON : SCHED_OFF;
   }
   return a;
 }

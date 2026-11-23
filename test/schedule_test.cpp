@@ -40,6 +40,34 @@ int main() {
   CHECK(scheduleCheckRule(list, n, rule(MON, 3, 0, 3, 30), -1) == RULE_FULL);
   CHECK(scheduleCheckRule(list, n, rule(MON, 3, 0, 3, 30), 0) == RULE_OK);
 
+  // --- off-only rules: no on time, one single minute ---
+  { ScheduleRule night = rule(MON | TUE, 0, 0, 23, 0); night.onMinute = SCHEDULE_NO_TIME;                                // Monday and Tuesday 23:00 off
+    ScheduleRule l2[3]; int c2 = 0; l2[c2++] = rule(MON, 18, 0, 22, 0);
+    CHECK(scheduleCheckRule(l2, c2, night, -1) == RULE_OK);
+    CHECK(scheduleCheckRule(l2, c2, rule(MON, 22, 1, 23, 0), -1) == RULE_OK);
+    l2[c2++] = night;
+    CHECK(scheduleCheckRule(l2, c2, night, -1) == RULE_OVERLAP);                                                         // same minute twice
+    CHECK(scheduleCheckRule(l2, c2, rule(MON, 22, 1, 23, 0), -1) == RULE_OVERLAP);                                       // touches the off-only minute
+    CHECK(scheduleCheckRule(l2, c2, rule(MON, 22, 1, 22, 59), -1) == RULE_OK);
+    CHECK(scheduleCheckRule(l2, c2, rule(MON, 22, 0, 1, 0), -1) == RULE_OVERLAP);                                        // block over midnight around it
+    { ScheduleRule inside = night; inside.offMinute = 19 * 60; CHECK(scheduleCheckRule(l2, 1, inside, -1) == RULE_OVERLAP); }   // inside 18:00-22:00
+    { ScheduleRule bad = night; bad.offMinute = 1440; CHECK(scheduleCheckRule(l2, 1, bad, -1) == RULE_BAD_TIME); }
+    { ScheduleRule noDay = night; noDay.days = 0; CHECK(scheduleCheckRule(l2, 1, noDay, -1) == RULE_NO_DAY); }
+    // what is due: off-if-on on its own days only (not the day after), nothing at other times
+    ScheduleState st; scheduleReset(st);
+    CHECK(due(&night, 1, st, 0, 22, 59) == SCHED_NONE);
+    CHECK(due(&night, 1, st, 0, 23, 0) == SCHED_OFF_IF_ON);                                                              // Monday
+    CHECK(due(&night, 1, st, 1, 23, 0) == SCHED_OFF_IF_ON);                                                              // Tuesday
+    CHECK(due(&night, 1, st, 2, 23, 0) == SCHED_NONE);                                                                   // Wednesday: not a day of the rule
+    { ScheduleRule early = night; early.offMinute = 30; scheduleReset(st); due(&early, 1, st, 1, 0, 29); CHECK(due(&early, 1, st, 1, 0, 30) == SCHED_OFF_IF_ON);
+      scheduleReset(st); due(&early, 1, st, 2, 0, 29); CHECK(due(&early, 1, st, 2, 0, 30) == SCHED_NONE); }               // not the day after the rule's day
+    { ScheduleRule off = night; off.enabled = false; scheduleReset(st); due(&off, 1, st, 0, 22, 59); CHECK(due(&off, 1, st, 0, 23, 0) == SCHED_NONE); }
+    // flash format
+    uint8_t blob[SCHEDULE_BLOB_SIZE]; ScheduleRule out[SCHEDULE_MAX_RULES];
+    scheduleEncode(l2, c2, blob); CHECK(scheduleDecode(blob, sizeof(blob), out) == 2);
+    CHECK(out[1].onMinute == SCHEDULE_NO_TIME && out[1].offMinute == 1380 && out[1].days == (MON | TUE));
+  }
+
   // --- flash format ---
   { ScheduleRule a[2] = { rule(MON | FRI, 6, 30, 7, 45), rule(SUN, 22, 0, 1, 0, false) }; uint8_t blob[SCHEDULE_BLOB_SIZE]; ScheduleRule out[SCHEDULE_MAX_RULES];
     scheduleEncode(a, 2, blob); CHECK(scheduleDecode(blob, sizeof(blob), out) == 2);
