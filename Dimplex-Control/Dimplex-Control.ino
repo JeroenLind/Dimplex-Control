@@ -42,6 +42,16 @@
  *   - First boot (or Wi-Fi fails): starts an AP "Dimplex-Setup" (password "dimplex123").
  *   - Settings are saved to flash (NVS) and survive reboots and power loss.
  */
+// Workaround for Arduino-ESP32 core 4.0: the core releases the BLE memory at boot unless a BLE library has registered
+// through this header (NimBLE-Arduino issue 1199; fixed in NimBLE-Arduino master but not yet in a release). The header
+// does not exist in older cores, so it is only included when present. EXPERIMENT: not in main, see docs/design.md.
+#if defined(__has_include)
+#if __has_include(<esp32-hal-alloc-ble-mem.h>)
+#include <esp32-hal-alloc-ble-mem.h>
+#define BLE_MEM_HEADER_INCLUDED 1
+#endif
+#endif
+
 #include <WiFi.h>
 #include <time.h>
 #include <ESPmDNS.h>
@@ -2602,6 +2612,11 @@ void setup() {
   loadSettings();
   logLine("cfg", "mqtt host=%s port=%s user=%s", cfg_mqttHost, cfg_mqttPort, cfg_mqttUser);
 
+#ifdef BLE_MEM_HEADER_INCLUDED
+  logLine("ble", "esp32-hal-alloc-ble-mem.h included (core 4.0 workaround)");
+#else
+  logLine("ble", "esp32-hal-alloc-ble-mem.h not available in this core");
+#endif
   g_bleInitOk = NimBLEDevice::init("dimplex-control");
   if (g_bleInitOk) logLine("ble", "BLE stack started");
   else { logLine("ble", "BLE init FAILED: stack not started"); logLine("ble", "  check board package and NimBLE-Arduino versions"); }
