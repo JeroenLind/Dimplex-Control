@@ -746,7 +746,7 @@ static String versionText() {
 #ifdef NIMBLE_CPP_VERSION_MAJOR
   t += String(NIMBLE_CPP_VERSION_MAJOR) + "." + String(NIMBLE_CPP_VERSION_MINOR) + "." + String(NIMBLE_CPP_VERSION_PATCH);
 #else
-  t += "unknown (older than 2.0?)";
+  t += "unknown (no version header: before 2.5, or not this library)";
 #endif
   return t;
 }
