@@ -28,6 +28,7 @@ Built and tested on a **Dimplex Engine 56/600** (Pro Range, ENG56-600, firmware 
 
 - An ESP32 board (developed on the *ESP32 Dev Module*).
 - Arduino IDE (or compatible) with the ESP32 board package and these libraries: **NimBLE-Arduino 2.x**, **PubSubClient** (2.8 or newer), **WiFiManager**.
+- **Use ESP32 board package 3.3.x for now (tested with 3.3.13, together with NimBLE-Arduino 2.3.9).** With board package (Arduino-ESP32 core) **4.0.0** the Bluetooth connection to the fireplace fails at once (`connect failed after 0 ms, error 0` in the log), most likely because core 4.0 has a rewritten Bluetooth layer that NimBLE-Arduino does not support yet (see NimBLE-Arduino issues 1199 and 1219). Install 3.3.x in the Boards Manager and switch off automatic updates of the board package, otherwise the Arduino IDE offers 4.0 again. The Debug page and the boot log show which versions you are running; if the BLE stack does not start, the log says `BLE init FAILED`.
 - An MQTT broker (for example the Mosquitto add-on in Home Assistant) if you want Home Assistant integration. The web interface works without it.
 - The **pairing passkey** of your fireplace (see below).
 

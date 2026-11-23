@@ -67,6 +67,16 @@ int main() {
   for (int i = 0; i < g_rtcLog.count; i++) CK(strlen(g_rtcLog.lines[i]) < LOG_RING_LINE_LENGTH - 1);   // nothing is cut off
   publishSnapshot(); g_bleEnabled = true; handleMainPage();                                              // and the Main page shows it while connecting
   CK(g_webServer.lastBody.find("Last attempt failed (1x since the last success): error 574 (0x23e)") != std::string::npos);
+  // Other failing calls are logged too: secure failure, a write that fails, a write while the link is down
+  g_rtcLog.head = 0; g_rtcLog.count = 0; g_bleClient->failConnect = false; g_bleClient->failSecure = true; g_bleClient->lastError = 0x205; g_bleConnected = false; g_haveTarget = true;
+  bleConnectToFireplace();
+  { std::string l2; for (int i = 0; i < g_rtcLog.count; i++) { l2 += g_rtcLog.lines[i]; l2 += "\n"; } CK(l2.find("secure failed, error 517 (0x205)") != std::string::npos); }
+  g_bleClient->failSecure = false;
+  g_rtcLog.head = 0; g_rtcLog.count = 0; g_bleConnected = true; NimBLERemoteCharacteristic::failWrite = true; uint8_t one = 1;
+  CK(!writeRegister(g_chControl, &one, 1)); CK(!writeRegister(nullptr, &one, 1)); g_bleConnected = false; CK(!writeRegister(g_chControl, &one, 1));
+  NimBLERemoteCharacteristic::failWrite = false;
+  { std::string l3; for (int i = 0; i < g_rtcLog.count; i++) { l3 += g_rtcLog.lines[i]; l3 += "\n"; CK(strlen(g_rtcLog.lines[i]) < LOG_RING_LINE_LENGTH - 1); }
+    CK(l3.find("write 0x0040 failed, error 517") != std::string::npos && l3.find("write skipped: register not found") != std::string::npos && l3.find("write 0x0040 skipped: link is down") != std::string::npos); }
   CK(bleErrorText(2) != nullptr && !strcmp(bleErrorText(0), "no error recorded") && strlen(bleErrorText(15)) < 60);
   handleDebugPage(); CK(g_webServer.lastBody.find("<h3>Versions</h3>") != std::string::npos && g_webServer.lastBody.find("NimBLE-Arduino ") != std::string::npos && g_webServer.lastBody.find("ESP32-STUB rev 3") != std::string::npos);
   printf("model test: %d failed\n", fails); return fails;

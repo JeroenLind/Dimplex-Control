@@ -666,6 +666,7 @@ static bool findFireplaceCharacteristics() {
     }
   g_ident.volumeHandle = g_chVolume ? g_chVolume->getHandle() : 0; g_ident.initHandle = g_chInit ? g_chInit->getHandle() : 0;
   g_ident.known = g_chControl != nullptr;
+  if (!g_chControl) logLine("ble", "register 0x0040 (control) not found: wrong device or unknown layout");
   logLine("ble", "volume register at 0x%04x, handshake register at 0x%04x", g_ident.volumeHandle, g_ident.initHandle);
   logLine("ble", "fireplace %s, firmware %s, serial %s, 0x2009=%02x, 0x200b=%02x%02x", g_ident.name, g_ident.firmware, g_ident.serial, g_ident.hardware, g_ident.reg200b[0], g_ident.reg200b[1]);
   return g_chControl != nullptr;
@@ -674,8 +675,11 @@ static bool findFireplaceCharacteristics() {
 // Write `length` bytes to a register (with response). Returns false when the register is unknown, the link is down
 // (also when it dropped a moment ago) or the write failed. Never dereferences a null pointer.
 static bool writeRegister(NimBLERemoteCharacteristic *characteristic, const uint8_t *data, size_t length) {
-  if (!characteristic || !g_bleConnected) return false;
-  return characteristic->writeValue(data, length, true);
+  if (!characteristic) { logLine("ble", "write skipped: register not found"); return false; }
+  if (!g_bleConnected) { logLine("ble", "write 0x%04x skipped: link is down", characteristic->getHandle()); return false; }
+  bool ok = characteristic->writeValue(data, length, true);
+  if (!ok) logLine("ble", "write 0x%04x failed, error %d", characteristic->getHandle(), g_bleClient ? g_bleClient->getLastError() : -1);
+  return ok;
 }
 
 // Write the real local time to the fireplace clock (0x0012), in the format the remote uses:
@@ -799,6 +803,7 @@ static const char *bleErrorText(int code) {
     default: return code >= 0x200 && code < 0x300 ? "controller (HCI) error" : "see NimBLE ble_hs.h";
   }
 }
+static bool g_bleInitOk = true;                // result of NimBLEDevice::init() in setup(), for the log
 static const char *g_targetSource = "";        // where the target address came from, for the log: pinned, remembered, auto-detected
 
 // One connect attempt: decide which fireplace (pinned address, remembered address or a scan), connect and pair.
@@ -806,8 +811,10 @@ static const char *g_targetSource = "";        // where the target address came 
 static void bleConnectToFireplace() {
   logLine("ble", "Connecting");
   if (g_bleConnected) return;
+  if (!g_bleInitOk) logLine("ble", "  note: BLE init failed at boot, stack is not running");
   if (!g_bleClient) {
     g_bleClient = NimBLEDevice::createClient();
+    if (!g_bleClient) { logLine("ble", "createClient failed (no memory or BLE stack not running)"); return; }
     g_bleClient->setClientCallbacks(new FireplaceClientCallbacks(), false);
     g_bleClient->setConnectTimeout(5000);           // while the original remote holds the only link, connect() cannot succeed
   }
@@ -839,13 +846,22 @@ static void bleConnectToFireplace() {
     }
     return;
   }
-  if (!g_bleClient->secureConnection()) { logLine("ble", "secure failed"); return; }
+  if (!g_bleClient->secureConnection()) {
+    int err = g_bleClient->getLastError();
+    logLine("ble", "secure failed, error %d (0x%x)", err, err);
+    logLine("ble", "  %s", bleErrorText(err));
+    return;
+  }
 }
 
 // Read up to maxLength bytes of a register into out[]. Returns the number of bytes read (0 = failed).
 static size_t readRegister(NimBLERemoteCharacteristic *characteristic, uint8_t *out, size_t maxLength) {
   if (!characteristic || !g_bleConnected) return 0;
   NimBLEAttValue value = characteristic->readValue();
+  if (value.length() == 0) {                         // polled often: log at most once every 30 s
+    static uint32_t lastLogMs = 0;
+    if (millis() - lastLogMs > 30000 || lastLogMs == 0) { lastLogMs = millis(); logLine("ble", "read 0x%04x failed or empty, error %d", characteristic->getHandle(), g_bleClient ? g_bleClient->getLastError() : -1); }
+  }
   size_t length = value.length() < maxLength ? value.length() : maxLength;
   for (size_t i = 0; i < length; i++) out[i] = value[i];
   return length;
@@ -2439,7 +2455,7 @@ static void ledTask(void *) {
 static void startLeds() {
   const int pins[4] = { LED_PIN_STATUS, LED_PIN_WIFI, LED_PIN_MQTT, LED_PIN_BLE };
   for (int pin : pins) if (pin >= 0) { pinMode(pin, OUTPUT); setLed(pin, false); }
-  xTaskCreatePinnedToCore(ledTask, "led", 2048, nullptr, 1, nullptr, 1);
+  if (xTaskCreatePinnedToCore(ledTask, "led", 2048, nullptr, 1, nullptr, 1) != pdPASS) logLine("boot", "creating the LED task failed (memory?)");
 }
 
 // =====================================================================================================
@@ -2480,13 +2496,16 @@ void setup() {
 
   g_commandQueue = xQueueCreate(8, sizeof(Command));
   g_snapshotMutex = xSemaphoreCreateMutex();
+  if (!g_commandQueue || !g_snapshotMutex) logLine("boot", "creating the command queue or snapshot mutex failed (memory?)");
   startLeds();
 
   loadSettings();
   logLine("cfg", "mqtt host=%s port=%s user=%s", cfg_mqttHost, cfg_mqttPort, cfg_mqttUser);
 
-  NimBLEDevice::init("dimplex-control");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  g_bleInitOk = NimBLEDevice::init("dimplex-control");
+  if (g_bleInitOk) logLine("ble", "BLE stack started");
+  else { logLine("ble", "BLE init FAILED: stack not started"); logLine("ble", "  check board package and NimBLE-Arduino versions"); }
+  if (!NimBLEDevice::setPower(ESP_PWR_LVL_P9)) logLine("ble", "setPower failed");
   NimBLEDevice::setSecurityAuth(false, true, false);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_KEYBOARD_DISPLAY);
 
@@ -2500,8 +2519,8 @@ void setup() {
   WiFi.setAutoReconnect(true);             // explicit; checkWifiConnection() is the safety net when it does not work
   publishSnapshot();                       // initial snapshot (nothing connected yet)
   // Both worker tasks run on core 0 below the Wi-Fi/BT system tasks; loop() (web) keeps core 1 to itself.
-  xTaskCreatePinnedToCore(bleTask,  "ble",  8192, nullptr, 1, nullptr, 0);
-  xTaskCreatePinnedToCore(mqttTask, "mqtt", 8192, nullptr, 1, nullptr, 0);
+  if (xTaskCreatePinnedToCore(bleTask,  "ble",  8192, nullptr, 1, nullptr, 0) != pdPASS) logLine("boot", "creating the BLE task failed (memory?)");
+  if (xTaskCreatePinnedToCore(mqttTask, "mqtt", 8192, nullptr, 1, nullptr, 0) != pdPASS) logLine("boot", "creating the MQTT task failed (memory?)");
 }
 
 // Wi-Fi watchdog, called on every pass of loop(). The ESP32 reconnects by itself after a short outage, but not always (for
@@ -2557,7 +2576,7 @@ void loop() {
       g_ntpStarted = true;
     }
     if (!g_webStarted) {
-      MDNS.begin("dimplex-control");
+      if (!MDNS.begin("dimplex-control")) logLine("web", "mDNS start failed: dimplex-control.local will not resolve");
       MDNS.addService("http", "tcp", 80);
       startWebServer();
       logLine("web", "control UI at http://dimplex-control.local/  (or http://%s/)", WiFi.localIP().toString().c_str());

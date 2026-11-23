@@ -225,7 +225,7 @@ struct NimBLERemoteCharacteristic {
   NimBLEUUID getUUID() const { return NimBLEUUID(uuid); }
   int getHandle() const { return handle; }
   NimBLEAttValue readValue() { NimBLEAttValue v; v.d = g_sim.regs[handle]; return v; }
-  bool writeValue(const uint8_t *data, size_t n, bool) { g_sim.write(handle, data, n); return true; }
+  static inline bool failWrite = false; bool writeValue(const uint8_t *data, size_t n, bool) { if (failWrite) return false; g_sim.write(handle, data, n); return true; }
 };
 struct NimBLERemoteService {
   std::vector<NimBLERemoteCharacteristic *> chars;
@@ -249,7 +249,7 @@ struct NimBLEClient {
   void setConnectTimeout(int) {}
   bool failConnect = false;
   bool connect(const NimBLEAddress &) { if (failConnect) return false; connectedFlag = true; if (cb) cb->onConnect(this); return true; }
-  bool secureConnection() { return true; }
+  bool failSecure = false; bool secureConnection() { return !failSecure; }
   bool isConnected() { return connectedFlag; }
   void disconnect() { connectedFlag = false; if (cb) cb->onDisconnect(this, 0); }
   std::vector<NimBLERemoteService *> getServices(bool) { return { &service }; }
@@ -258,7 +258,7 @@ struct NimBLEAdvertisedDevice { std::string getName() const { return ""; } NimBL
 struct NimBLEScanResults { int getCount() const { return 0; } const NimBLEAdvertisedDevice *getDevice(int) const { return nullptr; } };
 struct NimBLEScan { bool isScanning() { return false; } void setActiveScan(bool) {} NimBLEScanResults getResults(int, bool) { return NimBLEScanResults(); } void clearResults() {} };
 struct NimBLEDevice {
-  static void init(const char *) {} static void setPower(int) {} static void setSecurityAuth(bool, bool, bool) {} static void setSecurityIOCap(int) {}
+  static inline bool initResult = true; static bool init(const char *) { return initResult; } static bool setPower(int) { return true; } static void setSecurityAuth(bool, bool, bool) {} static void setSecurityIOCap(int) {}
   static NimBLEClient *createClient() { return new NimBLEClient(); }
   static NimBLEScan *getScan() { static NimBLEScan s; return &s; }
   static void injectPassKey(NimBLEConnInfo &, uint32_t) {} static void injectConfirmPasskey(NimBLEConnInfo &, bool) {}
