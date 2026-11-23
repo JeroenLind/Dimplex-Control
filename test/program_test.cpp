@@ -41,5 +41,23 @@ int main() {
   handleSettingsPage(); CK(g_webServer.lastBody.find("Time zone") != std::string::npos);
   // delete
   g_webServer.args = {{"del","0"}}; handleProgramSet(); CK(g_ruleCount == 0);
+  // off-only rule: no on time, form field left empty. Overlap with another rule is refused, "already off" does nothing.
+  { uint32_t k; int w; localMinuteKey(k, w); int t0 = (int)(k % 1440) + 2; char offA[8], insideT[8], dayA[3] = { 'd', (char)('0' + w), 0 };
+    snprintf(offA, 8, "%02d:%02d", t0 / 60 % 24, t0 % 60); snprintf(insideT, 8, "%02d:%02d", (t0 + 1) / 60 % 24, (t0 + 1) % 60);
+    g_webServer.args = {{dayA,"1"},{"on",""},{"off",offA}}; handleProgramSet(); CK(g_ruleCount == 1 && g_rules[0].onMinute == SCHEDULE_NO_TIME);
+    g_webServer.args = {{dayA,"1"},{"on",""},{"off",offA}}; handleProgramSet(); CK(g_ruleCount == 1);                  // same minute: refused
+    g_webServer.args = {{dayA,"1"},{"on",""},{"off",""}}; handleProgramSet(); CK(g_ruleCount == 1);                    // nothing filled in
+    g_webServer.args = {{dayA,"1"},{"on","00:00"},{"off","23:59"}}; handleProgramSet(); CK(g_ruleCount == 1);          // a block around it: refused
+    handleProgramPage(); CK(g_webServer.lastBody.find("&ndash;") != std::string::npos);
+    loadProgram(); CK(g_ruleCount == 1 && g_rules[0].onMinute == SCHEDULE_NO_TIME);                                      // stored in flash
+    while (queued()) pop();
+    g_registersRead = true; g_regControl[0] = 0; g_bleConnected = true; publishSnapshot();                             // fireplace is off
+    scheduleReset(g_scheduleState); run(1); run(130); CK(queued() == 0);                                               // moment passes: nothing sent
+    CK(g_programPending.action == SCHED_NONE);
+    g_regControl[0] = 6; publishSnapshot();                                                                            // fireplace is on
+    uint32_t k2; int w2; localMinuteKey(k2, w2); int t1 = (int)(k2 % 1440) + 2; char offB[8]; snprintf(offB, 8, "%02d:%02d", t1 / 60 % 24, t1 % 60);
+    g_rules[0].offMinute = (uint16_t) t1; scheduleReset(g_scheduleState); run(1); run(130);
+    { bool off = false; while (queued()) { Command x = pop(); if (x.type == CMD_FLAME_EFFECT && x.argument == 0 && x.source == SOURCE_SCHEDULE) off = true; } CK(off); } }
+  g_ruleCount = 0;
   printf("harness: %d failed\n", fails); return fails;
 }

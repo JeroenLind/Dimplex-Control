@@ -1756,7 +1756,13 @@ static bool programActionDone(ScheduleAction a) {
   copySnapshot(g_webSnapshot);
   const SharedState &s = g_webSnapshot;
   if (!s.valid) return false;
-  return a == SCHED_ON ? (isFlameEffectOn(s) && isHeaterSwitchOn(s)) : !isFlameEffectOn(s);
+  return a == SCHED_ON ? (isFlameEffectOn(s) && isHeaterSwitchOn(s)) : !isFlameEffectOn(s);   // off and off-if-on: the flame effect is off
+}
+// An off-only moment does nothing when the fireplace is already off (flame effect and heater switch both off).
+static bool fireplaceAlreadyOff() {
+  copySnapshot(g_webSnapshot);
+  const SharedState &s = g_webSnapshot;
+  return s.valid && !isFlameEffectOn(s) && !isHeaterSwitchOn(s);
 }
 static void sendProgramCommand(ScheduleAction a) {
   bool ok = a == SCHED_ON ? queueCommand(CMD_HEATER, 2, SOURCE_SCHEDULE)          // flame effect first, then the heater, as the web button does
@@ -1775,10 +1781,13 @@ static void programTick() {
   ScheduleAction due = scheduleDue(g_rules, g_ruleCount, g_scheduleState, key, weekday);
   if (due != SCHED_NONE) {
     g_programPending.action = due; g_programPending.startMs = millis(); g_programPending.tried = false;
-    logLine("program", "moment due: %s", due == SCHED_ON ? "on" : "off");
+    logLine("program", "moment due: %s", due == SCHED_ON ? "on" : due == SCHED_OFF ? "off" : "off (only if on)");
   }
   if (g_programPending.action == SCHED_NONE) return;
   uint32_t now = millis();
+  if (g_programPending.action == SCHED_OFF_IF_ON && !g_programPending.tried && fireplaceAlreadyOff()) {
+    logLine("program", "already off, nothing to do"); g_programPending.action = SCHED_NONE; return;
+  }
   if (g_programPending.tried && now - g_programPending.lastTryMs < PROGRAM_RETRY_MS) return;
   if (g_programPending.tried && programActionDone(g_programPending.action)) { logLine("program", "done"); g_programPending.action = SCHED_NONE; return; }
   if (now - g_programPending.startMs >= PROGRAM_GIVE_UP_MS) { logLine("program", "gave up: the fireplace did not follow within 5 minutes"); g_programPending.action = SCHED_NONE; return; }
@@ -2173,7 +2182,7 @@ static void handleProgramPage() {
     form += "<table><tr><th>Days</th><th>On</th><th>Off</th><th>Active</th><th></th></tr>";
     for (int i = 0; i < g_ruleCount; i++) {
       const ScheduleRule &r = g_rules[i];
-      form += "<tr><td>" + daysText(r.days) + "</td><td>" + clockText(r.onMinute) + "</td><td>" + clockText(r.offMinute) + (r.offMinute <= r.onMinute ? " (next day)" : "") + "</td>"
+      form += "<tr><td>" + daysText(r.days) + "</td><td>" + (scheduleOffOnly(r) ? String("&ndash;") : clockText(r.onMinute)) + "</td><td>" + clockText(r.offMinute) + (!scheduleOffOnly(r) && r.offMinute <= r.onMinute ? " (next day)" : "") + "</td>"
               "<td><a class='b " + (r.enabled ? "on" : "") + "' href='/program/set?toggle=" + String(i) + "'>" + (r.enabled ? "Yes" : "No") + "</a></td>"
               "<td><a class='b warn' href='/program/set?del=" + String(i) + "'>Delete</a></td></tr>";
     }
@@ -2182,8 +2191,8 @@ static void handleProgramPage() {
   form += "<h3>Add a rule</h3><form action='/program/set'>";
   static const char *names[7] = { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
   for (int d = 0; d < 7; d++) form += String("<label><input type=checkbox name=d") + String(d) + " value=1> " + names[d] + "</label> ";
-  form += "<br>On: <input type=time name=on required> Off: <input type=time name=off required> <button class=b>Add</button>"
-          "<br><span class=dim>When the off time is earlier than the on time, the rule ends the next day. Up to " + String(SCHEDULE_MAX_RULES) + " rules; they may not overlap or touch.</span></form>";
+  form += "<br>On: <input type=time name=on> Off: <input type=time name=off required> <button class=b>Add</button>"
+          "<br><span class=dim>Leave <b>On</b> empty for an off-only rule: at that time everything is switched off, but only when the fireplace is on (for example every evening at bedtime). When the off time is earlier than the on time, the rule ends the next day. Up to " + String(SCHEDULE_MAX_RULES) + " rules; they may not overlap or touch.</span></form>";
   sendPage(PAGE_PROGRAM, form);
 }
 // /program/set: add, delete or toggle a rule, or switch the whole program. Then back to the Program page.
@@ -2201,12 +2210,13 @@ static void handleProgramSet() {
   if (g_webServer.hasArg("off")) {                                                    // the add form
     ScheduleRule r = { 0, 0, 0, true };
     for (int d = 0; d < 7; d++) if (g_webServer.hasArg((String("d") + String(d)).c_str())) r.days |= (uint8_t)(1 << d);
-    int on = parseClockMinutes(g_webServer.arg("on")), off = parseClockMinutes(g_webServer.arg("off"));
+    bool offOnly = g_webServer.arg("on").length() == 0;                              // no on time: an off-only rule
+    int on = offOnly ? (int) SCHEDULE_NO_TIME : parseClockMinutes(g_webServer.arg("on")), off = parseClockMinutes(g_webServer.arg("off"));
     if (on < 0 || off < 0) setWebMessage("Rule not added: " + String(ruleCheckText(RULE_BAD_TIME)));
     else {
       r.onMinute = (uint16_t) on; r.offMinute = (uint16_t) off;
       RuleCheck check = scheduleCheckRule(g_rules, g_ruleCount, r, -1);
-      if (check == RULE_OK) { g_rules[g_ruleCount++] = r; saveProgramRules(); setWebMessage("Rule added"); logLine("program", "rule added: %s %s-%s", daysText(r.days).c_str(), clockText(on).c_str(), clockText(off).c_str()); }
+      if (check == RULE_OK) { g_rules[g_ruleCount++] = r; saveProgramRules(); setWebMessage("Rule added"); if (offOnly) logLine("program", "rule added: %s off at %s", daysText(r.days).c_str(), clockText(off).c_str()); else logLine("program", "rule added: %s %s-%s", daysText(r.days).c_str(), clockText(on).c_str(), clockText(off).c_str()); }
       else setWebMessage("Rule not added: " + String(ruleCheckText(check)));
     }
   }
