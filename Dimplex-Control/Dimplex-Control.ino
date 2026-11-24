@@ -161,7 +161,7 @@ static bool g_webStarted = false;
 
 enum CommandType : uint8_t { CMD_FLAME_EFFECT, CMD_HEATER, CMD_HEATER_POWER, CMD_SETPOINT, CMD_SETPOINT_DELTA,
                              CMD_FLAME_LEVEL, CMD_VOLUME, CMD_BLE_RELEASE, CMD_BLE_RESUME,
-                             CMD_SCAN, CMD_APPLY_SETTINGS, CMD_FACTORY_RESET, CMD_CONTROL_MODE, CMD_APPLY_THERMOSTAT, CMD_SET_HAS_SOUND };
+                             CMD_SCAN, CMD_APPLY_SETTINGS, CMD_FACTORY_RESET, CMD_CONTROL_MODE, CMD_APPLY_THERMOSTAT, CMD_SET_HAS_SOUND, CMD_APPLY_AUTOPOWER };
 enum CommandSource : uint8_t { SOURCE_WEB = 0, SOURCE_MQTT = 1, SOURCE_SCHEDULE = 2 };
 struct Command { CommandType type; int16_t argument; CommandSource source; };
 static QueueHandle_t g_commandQueue = nullptr;
@@ -203,6 +203,8 @@ struct SharedState {
   bool thermostatWanted;                     // the user wants heating (in a bridge mode this is what the Heater switch shows)
   int bridgeSetpoint;                        // setpoint of the bridge's own control, saved in flash
   ThermostatSettings thermo;                 // margins and time-out
+  AutoPowerSettings autoPower;               // Auto heater power: setting and limits
+  bool autoPowerActive; int autoShortfallTenths; bool autoShortfallValid;   // Auto is on and the mode has a sensor; the last shortfall
   int controlTempTenths; bool controlTempValid;   // temperature used by the last decision (tenths of a degree)
   char targetAddress[20];                    // fireplace we are connected to / will connect to
   char configuredAddress[20], passkeyText[12];   // selected fireplace ("" = auto-detect) and passkey, as saved
@@ -401,6 +403,14 @@ static bool readRoomTemperature(int &tenths, uint32_t &ageMs) {
 // bleTask validates and applies them (CMD_APPLY_THERMOSTAT), so the settings are only changed by one task.
 static int g_pendingThermostat[5] = {0, 0, 0, 0, 0};   // external off, external on, internal off, internal on, time-out
 static bool g_pendingThermostatValid = false;
+static int g_pendingAutoPower[3] = {0, 0, 0};            // on (0/1), high limit, low limit (tenths)
+static bool g_pendingAutoPowerValid = false;
+static void stageAutoPowerSettings(const int values[3]) {
+  xSemaphoreTake(g_snapshotMutex, portMAX_DELAY);
+  for (int i = 0; i < 3; i++) g_pendingAutoPower[i] = values[i];
+  g_pendingAutoPowerValid = true;
+  xSemaphoreGive(g_snapshotMutex);
+}
 static void stageThermostatSettings(const int values[5]) {
   xSemaphoreTake(g_snapshotMutex, portMAX_DELAY);
   for (int i = 0; i < 5; i++) g_pendingThermostat[i] = values[i];
@@ -457,6 +467,8 @@ static bool g_temperatureFresh = false;         // the last read of 0x0055 succe
 
 // ---- temperature control in the bridge (see thermostat.h) ----
 static ControlMode g_controlMode = CONTROL_FIREPLACE;   // saved in flash (key "ctlmode"); default: the fireplace regulates
+static AutoPowerSettings g_autoPower = AUTOPOWER_DEFAULT_SETTINGS;   // Auto heater power, saved in flash
+static int g_autoShortfallTenths = 0; static bool g_autoShortfallValid = false; static uint32_t g_autoPowerRetryAtMs = 0;
 static ThermostatSettings g_thermo = THERMOSTAT_DEFAULT_SETTINGS;   // margins and time-out, saved in flash
 static int g_bridgeSetpoint = 21;               // setpoint of the bridge's own control, saved in flash (key "bsetp")
 static bool g_thermostatWanted = false;         // the user wants heating (Heater switch on) in a bridge mode
@@ -496,7 +508,7 @@ static void publishSnapshot() {
   memcpy(s.history, g_history, sizeof(g_history)); s.historyCount = g_historyCount; s.historyHead = g_historyHead;
   s.tempMin = g_tempMin; s.tempMax = g_tempMax; s.lastTempChangeMs = g_lastTempChangeMs;
   s.controlMode = g_controlMode; s.thermostatState = g_thermostatState; s.thermostatWanted = g_thermostatWanted;
-  s.bridgeSetpoint = g_bridgeSetpoint; s.thermo = g_thermo; s.controlTempTenths = g_controlTempTenths; s.controlTempValid = g_controlTempValid;
+  s.bridgeSetpoint = g_bridgeSetpoint; s.thermo = g_thermo; s.autoPower = g_autoPower; s.autoPowerActive = g_autoPower.enabled && g_controlMode != CONTROL_FIREPLACE; s.autoShortfallTenths = g_autoShortfallTenths; s.autoShortfallValid = g_autoShortfallValid; s.controlTempTenths = g_controlTempTenths; s.controlTempValid = g_controlTempValid;
   g_thermostatDirty = false;
   g_sharedVersion = g_sharedVersion + 1;
   xSemaphoreGive(g_snapshotMutex);
@@ -547,6 +559,9 @@ static void loadSettings() {
                                 g_prefs.getUChar("ioff", g_thermo.internalOffAbove), g_prefs.getUChar("ion", g_thermo.internalOnBelow),
                                 g_prefs.getUShort("tmo", g_thermo.timeoutMinutes) };
   if (thermostatSettingsValid(loaded.externalOffAbove, loaded.externalOnBelow, loaded.internalOffAbove, loaded.internalOnBelow, loaded.timeoutMinutes)) g_thermo = loaded;
+  { int hi = g_prefs.getUChar("aphi", g_autoPower.highLimit), lo = g_prefs.getUChar("aplo", g_autoPower.lowLimit);
+    g_autoPower.enabled = g_prefs.getBool("apon", false);
+    if (autoPowerLimitsValid(hi, lo)) { g_autoPower.highLimit = (uint8_t) hi; g_autoPower.lowLimit = (uint8_t) lo; } }
   g_prefs.end();
   parsePasskey();
   loadProgram();
@@ -561,6 +576,11 @@ static void saveThermostatSettings() {
   g_prefs.putUChar("xoff", g_thermo.externalOffAbove); g_prefs.putUChar("xon", g_thermo.externalOnBelow);
   g_prefs.putUChar("ioff", g_thermo.internalOffAbove); g_prefs.putUChar("ion", g_thermo.internalOnBelow);
   g_prefs.putUShort("tmo", g_thermo.timeoutMinutes);
+  g_prefs.end();
+}
+static void saveAutoPower() {
+  g_prefs.begin("cfg", false);
+  g_prefs.putBool("apon", g_autoPower.enabled); g_prefs.putUChar("aphi", g_autoPower.highLimit); g_prefs.putUChar("aplo", g_autoPower.lowLimit);
   g_prefs.end();
 }
 // Remember (or clear, with nullptr) the auto-detected fireplace address so later boots can skip the scan.
@@ -1023,7 +1043,29 @@ static void syncFireplaceSetpoint() {
 //     off. The wish stays, so when a new temperature arrives the control continues by itself.
 //   - A heater that is running while the bridge did not ask for it (started on the fireplace itself, or after a restart of
 //     the bridge) is taken over, so it never runs unregulated.
+static bool bleSetHeaterPower(bool high);       // defined below
+static bool autoPowerActive() { return g_autoPower.enabled && g_controlMode != CONTROL_FIREPLACE; }
+// Auto heater power (docs/design.md section 5.8): called by runThermostat() with the temperature it used. Only while the heating
+// wish is on and the element runs (the fireplace refuses and keeps the last power otherwise).
+static void runAutoPower(int tenths, bool fresh) {
+  g_autoShortfallValid = false;
+  if (!autoPowerActive() || !g_thermostatWanted || !heaterIsOn()) return;
+  AutoPowerInput in = { fresh, tenths, g_bridgeSetpoint, g_autoPower };
+  AutoPowerDecision d = decideAutoPower(in);
+  g_autoShortfallTenths = d.shortfallTenths; g_autoShortfallValid = fresh;
+  if (d.choice == AUTOPOWER_KEEP) return;
+  bool wantHigh = d.choice == AUTOPOWER_HIGH;
+  if (g_regHeaterPower == (wantHigh ? 0x03 : 0x01)) { g_autoPowerRetryAtMs = 0; return; }       // already right
+  if (g_autoPowerRetryAtMs != 0 && (int32_t)(g_autoPowerRetryAtMs - millis()) > 0) return;      // a failed write: wait
+  if (!fresh) logLine("power", "auto: low, no temperature");
+  else logLine("power", "auto: %s, shortfall %d.%d (%d.%d / %d)", wantHigh ? "high" : "low", d.shortfallTenths / 10, abs(d.shortfallTenths % 10),
+                tenths / 10, abs(tenths % 10), g_bridgeSetpoint);
+  bleSetHeaterPower(wantHigh);
+  if (g_regHeaterPower == (wantHigh ? 0x03 : 0x01)) g_autoPowerRetryAtMs = 0;
+  else { g_autoPowerRetryAtMs = millis() + 30000; logLine("power", "auto: write failed, retry in 30 s"); }
+}
 static void runThermostat() {
+  g_autoShortfallValid = false;                         // set again by runAutoPower()
   if (!g_bleReady || !g_registersRead) return;
   if (g_controlMode == CONTROL_FIREPLACE || !flameEffectIsOn()) {     // no bridge control, or the fireplace is off
     g_thermostatWanted = false; setThermostatState(THERMO_INACTIVE); return;
@@ -1061,6 +1103,7 @@ static void runThermostat() {
     g_thermostatRetryAtMs = confirmed ? 0 : millis() + 30000;      // a switch that fails is tried again after 30 s
   }
   if (decision.heaterOn) syncFireplaceSetpoint();
+  runAutoPower(tenths, fresh);
 }
 
 // Heater button / switch. Without bridge control it switches the heater of the fireplace. With bridge control it sets or clears
@@ -1194,6 +1237,27 @@ static void bleApplyThermostatSettings() {
   setMessage("Temperature control settings saved");
   runThermostat();
 }
+// New Auto heater power settings staged by the web page: validate, save, log (bleTask only).
+static void bleApplyAutoPowerSettings() {
+  int values[3]; bool pending;
+  xSemaphoreTake(g_snapshotMutex, portMAX_DELAY);
+  for (int i = 0; i < 3; i++) values[i] = g_pendingAutoPower[i];
+  pending = g_pendingAutoPowerValid; g_pendingAutoPowerValid = false;
+  xSemaphoreGive(g_snapshotMutex);
+  if (!pending) return;
+  if (!autoPowerLimitsValid(values[1], values[2])) {
+    setMessage("Not saved: limits 0.1-5.0 degrees, high at least 0.1 above low");
+    logLine("power", "auto settings refused: high %d, low %d (tenths)", values[1], values[2]);
+    return;
+  }
+  g_autoPower.enabled = values[0] != 0; g_autoPower.highLimit = (uint8_t) values[1]; g_autoPower.lowLimit = (uint8_t) values[2];
+  g_autoPowerRetryAtMs = 0;
+  saveAutoPower();
+  logLine("power", "auto settings: %s, high %d.%d, low %d.%d", g_autoPower.enabled ? "on" : "off", values[1] / 10, values[1] % 10, values[2] / 10, values[2] % 10);
+  if (g_autoPower.enabled && g_controlMode == CONTROL_FIREPLACE) logLine("power", "auto: not active (fireplace thermostat mode)");
+  setMessage("Auto heater power settings saved");
+  runThermostat();
+}
 
 // Scan for fireplaces (4 s) and keep the result for the Settings page. A fireplace that already has a connection
 // (to this bridge or to a remote) does not advertise and is therefore not in the list.
@@ -1274,7 +1338,7 @@ static const char *commandName(CommandType type) {
     case CMD_VOLUME: return "volume";               case CMD_BLE_RELEASE: return "bluetooth release";
     case CMD_BLE_RESUME: return "bluetooth resume"; case CMD_SCAN: return "scan";
     case CMD_APPLY_SETTINGS: return "apply settings"; case CMD_FACTORY_RESET: return "factory reset";
-    case CMD_CONTROL_MODE: return "control mode";   case CMD_APPLY_THERMOSTAT: return "thermostat settings";
+    case CMD_CONTROL_MODE: return "control mode";   case CMD_APPLY_THERMOSTAT: return "thermostat settings"; case CMD_APPLY_AUTOPOWER: return "auto power settings";
     case CMD_SET_HAS_SOUND: return "sound setting";
   }
   return "?";
@@ -1285,7 +1349,9 @@ static void executeCommand(const Command &c) {
   switch (c.type) {
     case CMD_FLAME_EFFECT: bleSetFlameEffect(c.argument != 0); break;
     case CMD_HEATER:       bleSetHeater(c.argument != 0, c.argument == 2); break;       // 2 = on, and the flame effect first if it is off (web)
-    case CMD_HEATER_POWER: bleSetHeaterPower(c.argument != 0); break;
+    case CMD_HEATER_POWER:
+      if (autoPowerActive()) { setMessage("Heater power is automatic (Auto is on)"); logLine("power", "manual power ignored: Auto is on"); break; }
+      bleSetHeaterPower(c.argument != 0); break;
     case CMD_SETPOINT:     bleSetSetpoint(c.argument); break;
     case CMD_SETPOINT_DELTA:                                   // +/- buttons: relative to the value read now, so quick clicks add up
       if (g_controlMode != CONTROL_FIREPLACE) { bleSetBridgeSetpoint(g_bridgeSetpoint + c.argument); break; }
@@ -1299,6 +1365,7 @@ static void executeCommand(const Command &c) {
     case CMD_FACTORY_RESET:  bleFactoryReset(); break;
     case CMD_CONTROL_MODE:   bleSetControlMode((ControlMode) c.argument); break;
     case CMD_APPLY_THERMOSTAT: bleApplyThermostatSettings(); break;
+    case CMD_APPLY_AUTOPOWER:  bleApplyAutoPowerSettings(); break;
     case CMD_SET_HAS_SOUND:                                    // "My fireplace has sound": offers or hides Volume and Sound (web and Home Assistant)
       g_hasSound = c.argument != 0;
       g_prefs.begin("cfg", false); g_prefs.putBool("sound", g_hasSound); g_prefs.end();
@@ -2007,8 +2074,14 @@ static String buildSettingsLive(const SharedState &s) {
   h += "<h3>Flame level</h3>" + linkButtonRow("flame", AW_FLAME_LEVEL, ready ? level : -1, 1, 6, "F");
 
   h += "<h3>Heater power</h3>";
-  h += choiceButton("Low (0.9 kW)", setHref("hpwr=low"), ready && s.regHeaterPower == 0x01, AW_HEATER_POWER, 0) + choiceButton("High (1.8 kW)", setHref("hpwr=high"), ready && s.regHeaterPower == 0x03, AW_HEATER_POWER, 1);
-  h += "<p class=dim>Can only be changed while the heater is on. The fireplace remembers the setting.</p>";
+  if (s.autoPowerActive) {
+    h += String("<p><b>Automatic</b>: ") + (ready && s.regHeaterPower == 0x03 ? "high (1.8 kW)" : (ready && s.regHeaterPower == 0x01 ? "low (0.9 kW)" : "unknown")) +
+         (s.autoShortfallValid ? " &middot; shortfall " + tenthsText(s.autoShortfallTenths) + " &deg;C" : "") + "</p>"
+         "<p class=dim>The bridge chooses the power (Auto heater power, below). The manual choice is switched off while Auto is on.</p>";
+  } else {
+    h += choiceButton("Low (0.9 kW)", setHref("hpwr=low"), ready && s.regHeaterPower == 0x01, AW_HEATER_POWER, 0) + choiceButton("High (1.8 kW)", setHref("hpwr=high"), ready && s.regHeaterPower == 0x03, AW_HEATER_POWER, 1);
+    h += "<p class=dim>Can only be changed while the heater is on. The fireplace remembers the setting.</p>";
+  }
   if (ready && s.regHeaterPower != 0x01 && s.regHeaterPower != 0x03) h += "<p class=dim>Register 0x0048 = " + String(s.regHeaterPower, HEX) + "</p>";
 
   // Which temperature control is used (a button press); the margins and time-out are in the form below on this page.
@@ -2244,6 +2317,17 @@ static void handleSettingsPage() {
           "Room temperature time-out: <input type=number name=tmo min=1 max=240 value=" + String(s.thermo.timeoutMinutes) + "> minutes"
           "<input type=hidden name=r value=settings> <button class=b>Save</button>"
           "<br><span class=dim>Fail-safe for the room sensor: when no room temperature has arrived for this long, the heater is switched off. It starts again by itself when a new value arrives.</span></form>";
+  {
+    bool noSensor = s.controlMode == CONTROL_FIREPLACE;                    // Auto needs a temperature (docs/design.md 5.8)
+    String dis = noSensor ? " disabled" : "";
+    form += "<h3>Auto heater power</h3><form action='/set'><select name=apon" + dis + "><option value=0" + (s.autoPower.enabled ? "" : " selected") + ">Off</option><option value=1" +
+            (s.autoPower.enabled ? " selected" : "") + ">On</option></select> "
+            "High power when the temperature is at least <input type=number name=aphi step=0.1 min=0.1 max=5 value=" + tenthsText(s.autoPower.highLimit) + dis + "> &deg;C below the setpoint, "
+            "low power again when it is at most <input type=number name=aplo step=0.1 min=0.1 max=5 value=" + tenthsText(s.autoPower.lowLimit) + dis + "> &deg;C below it. "
+            "<input type=hidden name=r value=settings> <button class=b" + dis + ">Save</button>"
+            "<br><span class=dim>" + (noSensor ? "Needs a temperature sensor mode (room sensor or internal sensor). " : "") +
+            "In between the power stays as it is. While Auto is on the manual choice low/high is switched off. The high limit must be at least 0.1 above the low limit.</span></form>";
+  }
   static const struct { const char *value; const char *label; } zones[] = {
     { "CET-1CEST,M3.5.0,M10.5.0/3", "Central Europe (Amsterdam, Berlin, Paris)" }, { "GMT0BST,M3.5.0/1,M10.5.0", "United Kingdom, Ireland (London)" },
     { "WET0WEST,M3.5.0/1,M10.5.0", "Portugal (Lisbon)" }, { "EET-2EEST,M3.5.0/3,M10.5.0/4", "Eastern Europe (Helsinki, Athens)" }, { "UTC0", "UTC" } };
@@ -2353,6 +2437,12 @@ static void handleSet() {
     int values[5] = { tenthsOf("xoff"), tenthsOf("xon"), tenthsOf("ioff"), tenthsOf("ion"), g_webServer.arg("tmo").toInt() };
     stageThermostatSettings(values);                                                               // the BLE task validates and applies them
     queued &= queueCommand(CMD_APPLY_THERMOSTAT, 0, SOURCE_WEB);
+  }
+  if (g_webServer.hasArg("aphi")) {                                                                // Auto heater power form on the Settings page
+    auto tenthsOf = [&](const char *name) { return (int) lroundf(g_webServer.arg(name).toFloat() * 10.0f); };
+    int values[3] = { g_webServer.arg("apon") == "1" ? 1 : 0, tenthsOf("aphi"), tenthsOf("aplo") };
+    stageAutoPowerSettings(values);                                                                // the BLE task validates and applies them
+    queued &= queueCommand(CMD_APPLY_AUTOPOWER, 0, SOURCE_WEB);
   }
   if (g_webServer.hasArg("tz")) {                                                                  // time zone form on the Settings page
     String zone = g_webServer.arg("tzcustom"); zone.trim(); if (zone.length() == 0) zone = g_webServer.arg("tz");

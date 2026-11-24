@@ -2,7 +2,7 @@
 // Build and run:  g++ -std=c++17 -w -I test/stubs -I Dimplex-Control test/model_test.cpp -o /tmp/model_test && /tmp/model_test
 #include "../Dimplex-Control/Dimplex-Control.ino"
 int g_simRestarts = 0; EspStub ESP; WiFiStub WiFi; uint32_t g_simMillis = 0; SerialStub Serial; MdnsStub MDNS; std::vector<Published> g_simPublished;
-FireplaceSim g_sim; void FireplaceSim::write(int, const uint8_t *, size_t) {} NimBLEClient::NimBLEClient() {}
+FireplaceSim g_sim; void FireplaceSim::write(int h, const uint8_t *d, size_t n) { if (failWrites > 0) { failWrites--; return; } writes++; writeLog.push_back(h); regs[h] = std::vector<uint8_t>(d, d + n); } NimBLEClient::NimBLEClient() {}
 static int fails = 0;
 #define CK(c) do { if (!(c)) { fails++; printf("FAIL %d: %s\n", __LINE__, #c); } } while (0)
 
@@ -79,5 +79,53 @@ int main() {
     CK(l3.find("write 0x0040 failed, error 517") != std::string::npos && l3.find("write skipped: register not found") != std::string::npos && l3.find("write 0x0040 skipped: link is down") != std::string::npos); }
   CK(bleErrorText(2) != nullptr && !strcmp(bleErrorText(0), "no error recorded") && strlen(bleErrorText(15)) < 60);
   handleDebugPage(); CK(g_webServer.lastBody.find("<h3>Versions</h3>") != std::string::npos && g_webServer.lastBody.find("NimBLE-Arduino ") != std::string::npos && g_webServer.lastBody.find("ESP32-STUB rev 3") != std::string::npos);
+  // ---- Auto heater power (docs/design.md 5.8) ----
+  { static NimBLERemoteCharacteristic chHeater(0x0014, 0), chPower(0x0048, 0), chTemp(0x0055, 0);
+    g_chHeater = &chHeater; g_chHeaterPower = &chPower; g_chTemperature = &chTemp;
+    g_bleConnected = true; g_bleReady = true; g_registersRead = true; g_bleClient->failConnect = false; g_bleClient->failSecure = false;
+    g_sim.regs[0x0040] = {0x06, 0x00}; g_sim.regs[0x0014] = {0x00, 0x00}; g_sim.regs[0x0048] = {0x01};         // effect on, element running, low power
+    auto setTemp = [&](int whole, int tenth) { g_sim.regs[0x0055] = {0x00, (uint8_t) whole, (uint8_t) tenth}; readFireplaceState(); };
+    g_rtcLog.head = 0; g_rtcLog.count = 0;
+    g_controlMode = CONTROL_INTERNAL; g_bridgeSetpoint = 21; g_autoPower = { true, 11, 10 }; g_thermostatWanted = false;
+    setTemp(19, 6); runThermostat();                                                                         // shortfall 1.4 -> high
+    CK(g_thermostatWanted && g_regHeaterPower == 0x03);
+    setTemp(20, 0); runThermostat(); CK(g_regHeaterPower == 0x01);                                           // shortfall 1.0 -> low
+    setTemp(19, 9); runThermostat(); CK(g_regHeaterPower == 0x03);                                           // shortfall 1.1 -> high (boundary)
+    g_autoPower = { true, 15, 5 };                                                                           // a wide band: stays as it is inside it
+    setTemp(20, 0); runThermostat(); CK(g_regHeaterPower == 0x03);                                           // shortfall 1.0, between 0.5 and 1.5
+    setTemp(20, 6); runThermostat(); CK(g_regHeaterPower == 0x01);                                           // shortfall 0.4 -> low
+    setTemp(20, 0); runThermostat(); CK(g_regHeaterPower == 0x01);                                           // inside the band again: no change
+    int writesBefore = g_sim.writes; setTemp(20, 0); runThermostat(); runThermostat(); CK(g_sim.writes == writesBefore);   // nothing is written when nothing changes
+    // the snapshot shows it, the manual buttons are replaced
+    g_autoPower = { true, 11, 10 }; setTemp(19, 6); runThermostat(); publishSnapshot();
+    handleSettingsPage(); CK(g_webServer.lastBody.find("<b>Automatic</b>: high (1.8 kW)") != std::string::npos && g_webServer.lastBody.find("shortfall 1.4") != std::string::npos);
+    CK(g_webServer.lastBody.find("hpwr=low") == std::string::npos && g_webServer.lastBody.find("Auto heater power</h3>") != std::string::npos);
+    // a manual command is ignored while Auto is active
+    { Command c = { CMD_HEATER_POWER, 0, SOURCE_WEB }; executeCommand(c); CK(g_regHeaterPower == 0x03); }
+    // a write that the fireplace ignores: logged, retried after 30 s
+    setTemp(20, 6); g_sim.failWrites = 1; runThermostat(); CK(g_regHeaterPower == 0x03);
+    g_simMillis += 10000; g_sim.failWrites = 0; runThermostat(); CK(g_regHeaterPower == 0x03);                // too early to retry
+    g_simMillis += 25000; runThermostat(); CK(g_regHeaterPower == 0x01);
+    // the element is off (target reached): nothing is written; Auto corrects the power when it runs again
+    g_sim.regs[0x0014] = {0x04, 0x00}; setTemp(22, 5); g_autoPowerRetryAtMs = 0; size_t logBefore = g_sim.writeLog.size(); g_sim.writes += 0; runThermostat(); { bool power = false; for (size_t k = logBefore; k < g_sim.writeLog.size(); k++) if (g_sim.writeLog[k] == 0x0048) power = true; CK(!power); }   // the thermostat may switch the element, Auto does not write the power
+    // back to a running element with the power high (for the next step)
+    g_sim.regs[0x0014] = {0x00, 0x00}; g_sim.regs[0x0048] = {0x03}; readFireplaceState();
+    // Auto is not active in the mode Fireplace thermostat: manual works, page greyed out
+    g_controlMode = CONTROL_FIREPLACE; publishSnapshot();
+    { Command c = { CMD_HEATER_POWER, 0, SOURCE_WEB }; executeCommand(c); CK(g_regHeaterPower == 0x01); }
+    handleSettingsPage(); CK(g_webServer.lastBody.find("hpwr=low") != std::string::npos && g_webServer.lastBody.find("Needs a temperature sensor mode") != std::string::npos && g_webServer.lastBody.find("name=aphi step=0.1 min=0.1 max=5 value=1.1 disabled") != std::string::npos);
+    g_controlMode = CONTROL_INTERNAL;
+    // settings: refused entries are not saved, valid ones are saved and survive a restart
+    g_webServer.args = {{"apon","1"},{"aphi","1.0"},{"aplo","1.0"},{"r","settings"}}; handleSet(); { Command c; xQueueReceive(g_commandQueue, &c, 0); CK(c.type == CMD_APPLY_AUTOPOWER); executeCommand(c); }
+    CK(g_autoPower.highLimit == 11 && g_autoPower.lowLimit == 10);                                            // unchanged
+    g_webServer.args = {{"apon","1"},{"aphi","2.5"},{"aplo","0.7"},{"r","settings"}}; handleSet(); { Command c; xQueueReceive(g_commandQueue, &c, 0); executeCommand(c); }
+    CK(g_autoPower.enabled && g_autoPower.highLimit == 25 && g_autoPower.lowLimit == 7);
+    g_autoPower = AutoPowerSettings AUTOPOWER_DEFAULT_SETTINGS; loadSettings(); CK(g_autoPower.enabled && g_autoPower.highLimit == 25 && g_autoPower.lowLimit == 7);
+    g_webServer.args = {{"apon","0"},{"aphi","1.1"},{"aplo","1.0"},{"r","settings"}}; handleSet(); { Command c; xQueueReceive(g_commandQueue, &c, 0); executeCommand(c); }
+    CK(!g_autoPower.enabled);
+    std::string pl; for (int i = 0; i < g_rtcLog.count; i++) { pl += g_rtcLog.lines[i]; pl += "\n"; if (strstr(g_rtcLog.lines[i], "[power]")) CK(strlen(g_rtcLog.lines[i]) < LOG_RING_LINE_LENGTH - 1); }   // the power lines fit
+    CK(pl.find("auto: high, shortfall 1.4 (19.6 / 21)") != std::string::npos && pl.find("manual power ignored: Auto is on") != std::string::npos);
+    CK(pl.find("auto: write failed, retry in 30 s") != std::string::npos && pl.find("auto settings refused") != std::string::npos && pl.find("auto settings: on, high 2.5, low 0.7") != std::string::npos);
+  }
   printf("model test: %d failed\n", fails); return fails;
 }
