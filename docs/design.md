@@ -67,21 +67,16 @@ Status: **requirements only, not designed or built yet.** Idea of the owner: the
 | # | Requirement |
 |---|---|
 | H1 | A setting **Auto heater power** (on/off) on the Settings page, in the temperature control section. Default: off. The setting is stored in flash and survives a restart. It is not offered over MQTT/Home Assistant. |
-| H2 | Auto uses the **temperature of the chosen control mode**: the room sensor (MQTT) in the room sensor mode, the internal sensor (`0x0055`) in the internal sensor mode. In the mode *Fireplace thermostat* there is no temperature and Auto is **not available**. |
-| H3 | The **shortfall** is the setpoint (the bridge's setpoint) minus the temperature. The bridge switches to **high** power when the shortfall is at least the **high limit** and back to **low** power when the shortfall is at most the **low limit**. Between the two limits the power is not changed (hysteresis). A temperature above the setpoint is a negative shortfall and so gives low power. |
-| H4 | Both limits are **settable** on the Settings page, in steps of 0.1 °C. Defaults: **high limit 1.1 °C, low limit 1.0 °C** (the temperature is slow, so a narrow band is enough). |
+| H2 | Auto uses the **temperature of the chosen control mode**: the room sensor (MQTT) in the room sensor mode, the internal sensor (`0x0055`) in the internal sensor mode. In the mode *Fireplace thermostat* there is no temperature and Auto is **not available**: the switch stays visible on the Settings page but greyed out, with a short explanation. |
+| H3 | The **shortfall** is the setpoint (the bridge's setpoint) minus the temperature. The bridge switches to **high** power when the shortfall is at least the **high limit** and back to **low** power when the shortfall is at most the **low limit**. Between the two limits the power is not changed (hysteresis). A temperature above the setpoint is a negative shortfall and so gives low power. Switching Auto on while the shortfall lies between the limits leaves the current power as it is until a limit is crossed. |
+| H4 | Both limits are **settable** on the Settings page, in steps of 0.1 °C, from 0.1 to 5.0 °C, with the high limit at least 0.1 °C above the low limit (the page refuses anything else). Defaults: **high limit 1.1 °C, low limit 1.0 °C** (the temperature is slow, so a narrow band is enough). |
 | H5 | There is **no minimum time** between two power changes; the band between the limits is the only protection against switching to and fro. |
 | H6 | When the **temperature is not known** (room sensor time-out, no valid reading), Auto sets **low** power. |
 | H7 | While Auto is on, the bridge decides the power: the manual choice low/high (Settings page and the MQTT select `dimplex/heater_power/set`) is **ignored**. When Auto is switched off the power **stays as it is** and the manual choice works again. |
 | H8 | The power is changed with the existing heater power command, so it goes through the same queue and is confirmed like a manual change. Every automatic change is written to the **log** with the temperature, the setpoint, the shortfall and the new power (log tag `power`). |
-| H9 | Auto changes only the power. Switching the element on and off stays with the temperature control (section 5.5) and the weekly program is not affected. |
+| H9 | Auto changes the power **only while the heater is wanted on** (heater switch on). While the heater or the fireplace is off the power register is left alone, because the fireplace keeps the last power itself. Auto changes only the power. Switching the element on and off stays with the temperature control (section 5.5) and the weekly program is not affected. |
 
-**Open points (to be decided with the owner before the design):**
-1. While the heater is off (or the fireplace is off), should Auto change the power register, or only while the heater is switched on? Proposal: only while the heater wish is on; the fireplace keeps the last power when it is switched off.
-2. Allowed range of the two limits and the rule between them. Proposal: 0.1 to 5.0 °C and the high limit at least 0.1 °C above the low limit.
-3. Boundaries: with the defaults the sensor values are in steps of 0.1 °C. Is "shortfall at least 1.1" (high) and "at most 1.0" (low) the intended reading? Proposal: yes, inclusive as written in H3.
-4. Auto switched on while the shortfall lies between the limits and the current power is unknown or differs: keep the current power until a limit is crossed (proposal), or decide directly (below the middle of the band: low).
-5. In the mode *Fireplace thermostat*: show the Auto switch greyed out with a note (proposal), or hide it.
+No open points remain for the requirements. Details of the design (storage keys, page layout, where the decision runs) are decided in the design phase.
 
 ### Non-goals
 - No cloud connection. Everything stays on the local network.
