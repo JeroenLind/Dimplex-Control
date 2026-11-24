@@ -62,7 +62,7 @@ No open points remain for the requirements. Details of the design (storage forma
 
 ### Requirements: smart heater power (Auto)
 
-Status: **requirements only, not designed or built yet.** Idea of the owner: the fireplace can heat at low (0.9 kW) or high (1.8 kW) power. When the room is far below the setpoint it should heat at high power, and when it is close to the setpoint low power is enough. The temperature reacts slowly, so a small band between the two limits is enough. The requirements below were agreed with the owner.
+Status: **requirements agreed and designed (section 5.8), not built yet.** Idea of the owner: the fireplace can heat at low (0.9 kW) or high (1.8 kW) power. When the room is far below the setpoint it should heat at high power, and when it is close to the setpoint low power is enough. The temperature reacts slowly, so a small band between the two limits is enough. The requirements below were agreed with the owner.
 
 | # | Requirement |
 |---|---|
@@ -76,7 +76,7 @@ Status: **requirements only, not designed or built yet.** Idea of the owner: the
 | H8 | The power is changed with the existing heater power command, so it goes through the same queue and is confirmed like a manual change. Every automatic change is written to the **log** with the temperature, the setpoint, the shortfall and the new power (log tag `power`). |
 | H9 | Auto changes the power **only while the heater is wanted on** (heater switch on). While the heater or the fireplace is off the power register is left alone, because the fireplace keeps the last power itself. Auto changes only the power. Switching the element on and off stays with the temperature control (section 5.5) and the weekly program is not affected. |
 
-No open points remain for the requirements. Details of the design (storage keys, page layout, where the decision runs) are decided in the design phase.
+No open points remain for the requirements. The design is in section 5.8.
 
 ### Non-goals
 - No cloud connection. Everything stays on the local network.
@@ -155,7 +155,7 @@ The ESP32 is the only component that talks to the fireplace. Home Assistant neve
 | `dimplex/level/set` | `1` to `6` | Flame level |
 | `dimplex/volume/set` | `0` to `6` | Volume. Only subscribed to and acted on when the setting "My fireplace has sound" is on |
 | `dimplex/sound/set` | `ON` / `OFF` | Sound on (back to the last volume above 0, or 3) or off (volume 0). Same condition |
-| `dimplex/heater_power/set` | `low` / `high` (any case) | Heater power 0.9 / 1.8 kW. Anything else is ignored and logged. Works with the heater off too. Not echoed: the state follows the read-back from the fireplace |
+| `dimplex/heater_power/set` | `low` / `high` (any case) | Heater power 0.9 / 1.8 kW. Ignored (and logged) while Auto heater power is active (section 5.8). Anything else is ignored and logged. Works with the heater off too. Not echoed: the state follows the read-back from the fireplace |
 | `dimplex/ble/set` | `ON` / `OFF` | `ON` = bridge holds the Bluetooth link; `OFF` = release it for the remote |
 | `dimplex/program/set` | `ON` / `OFF` | Switch the weekly program as a whole on or off (applied by `loop()` within a second) |
 | `dimplex/room_temperature/set` | degrees, e.g. `21.3` | Room temperature for the control mode "Room sensor (MQTT)". Plain number only; anything else is ignored. Publish without retain. Subscribed in every mode, only used in that mode |
@@ -269,6 +269,7 @@ Namespace `cfg`:
 | `xoff`, `xon`, `ioff`, `ion` | Margins in tenths of a degree: room sensor off / on, internal sensor off / on |
 | `tmo` | Room temperature time-out in minutes |
 | `sound` | "My fireplace has sound": offers Volume and Sound (web and Home Assistant). Default off |
+| `apon`, `aphi`, `aplo` | Auto heater power: on/off (default off), high limit and low limit in tenths of a degree (defaults 11 and 10) |
 
 Namespace `prog` (own `Preferences` object, because `loop()` writes it while `bleTask` uses the one for `cfg`):
 
@@ -351,7 +352,7 @@ Wi-Fi, lwIP and the NimBLE host run as system tasks, mostly on core 0.
 struct Command { CommandType type; int16_t argument; CommandSource source; };
 ```
 
-Command types: flame effect, heater, heater power, setpoint, setpoint delta (the +/- buttons), flame level, volume, sound setting, Bluetooth release, Bluetooth resume, scan, apply settings, factory reset. Sending never blocks (`xQueueSend` with timeout 0); a full queue is reported as "Busy" and counted. The BLE task executes commands one at a time, in order. The +/- setpoint buttons send a delta that is applied to the value at execution time, so two quick clicks add up.
+Command types: flame effect, heater, heater power, setpoint, setpoint delta (the +/- buttons), Auto heater power settings, flame level, volume, sound setting, Bluetooth release, Bluetooth resume, scan, apply settings, factory reset. Sending never blocks (`xQueueSend` with timeout 0); a full queue is reported as "Busy" and counted. The BLE task executes commands one at a time, in order. The +/- setpoint buttons send a delta that is applied to the value at execution time, so two quick clicks add up.
 
 **State** (BLE task to web and MQTT) goes through one `SharedState` structure under one mutex:
 - The BLE task keeps its own private variables. After every change (command, poll, link change) `publishSnapshot()` copies them into `g_shared` under the mutex and increments a version counter.
@@ -491,6 +492,42 @@ Implements requirements P1 to P18. Same split as the thermostat: the decisions a
 - Retry uses the snapshot (effect on and heating wish set) as proof of success.
 
 **Tests.** `test/program_test.cpp` (against the stubs: adding with the overlap check, survival of a restart, the on command at the on time, retry after 30 s, give-up, the off command, the MQTT switch, the time zone form, rendering of both pages, delete). `schedule_test.cpp`: validation (overlap, touching, midnight crossing, week wrap, no day), due moments per weekday, midnight crossing, no catch-up at the first call, several missed minutes, daylight saving (skipped and repeated hour), dedupe within a minute.
+
+### 5.8 Smart heater power (Auto)
+
+Implements requirements H1 to H9 (section 1). The fireplace has two power steps (register `0x0048`: `01` low 0.9 kW, `03` high 1.8 kW). With Auto on, the bridge chooses the step from the temperature shortfall, with a narrow hysteresis. Same split as the thermostat: the decision is a plain function in `thermostat.h`, the switching is in `bleTask`.
+
+**Settings.** `AutoPowerSettings { bool enabled; uint8_t highLimit, lowLimit; }`, limits in tenths of a degree (defaults 11 and 10, H4). Flash keys `apon`, `aphi`, `aplo` in namespace `cfg` (H1); a stored value that fails validation is ignored at start and the defaults stay. `autoPowerLimitsValid(high, low)`: both between 1 and 50 (0.1 to 5.0 °C) and `high >= low + 1`. Auto is **active** when it is on and the control mode is *room sensor* or *internal sensor* (H2); the stored setting is kept when the mode is switched to *Fireplace thermostat* and works again when a sensor mode is chosen.
+
+**Decision (H3, H5, H6).** `decideAutoPower(in)` gets the shortfall inputs (temperature in tenths, whether it is usable, the bridge setpoint, the limits) and the power now (`currentHigh`) and returns the wanted power:
+
+| Situation | Wanted power |
+|---|---|
+| No usable temperature (room sensor time-out) | low (H6) |
+| shortfall = setpoint x 10 - temperature, at least `highLimit` | high |
+| shortfall at most `lowLimit` (also negative: above the setpoint) | low |
+| in between | as it is now (the hysteresis; the register itself is the memory, so nothing extra needs to be stored and a restart does not matter) |
+
+There is no minimum time between changes (H5). Switching Auto on with the shortfall between the limits therefore leaves the power alone until a limit is crossed.
+
+**Running it (H8, H9).** `runAutoPower()` is called at the end of `runThermostat()` (so once a second, in `bleTask`, with the temperature that the thermostat just used), only when Auto is active, the heating wish is on (`g_thermostatWanted`) and the element is actually running (`heaterIsOn()`); `bleSetHeaterPower()` refuses to write while the heater is off, and the fireplace keeps the last power by itself. While the element is switched off by the temperature control (target reached) nothing is written; at the next start `runAutoPower()` runs at once after the element is on and corrects the power. When the internal sensor cannot be read for one round `runThermostat()` returns early and the power is left as it is for that round. A change calls the existing `bleSetHeaterPower()` (write, read back, retry rules as for a manual change). A write that is not confirmed is tried again after 30 s, like the heater switch. The decision uses the register value that the last poll read (`g_regHeaterPower`); a value other than `01`/`03` counts as "unknown" and is not changed inside the band.
+
+**Manual commands (H7).** `CMD_HEATER_POWER` (web page, MQTT select, anything else) is refused in `bleTask` while Auto is active: no write, message `Heater power is automatic (Auto is on)` on the web page and a log line. When Auto is not active (off, or mode *Fireplace thermostat*) it works as before. Switching Auto off changes nothing on the fireplace.
+
+**Web.** The **Settings** page gets, in the *Temperature control* block, a small form: a checkbox *Auto heater power*, the two limit fields (step 0.1, 0.1 to 5.0) and Save. In the mode *Fireplace thermostat* the form is greyed out (disabled inputs) with the text "Needs a temperature sensor mode". The form posts `/set?apon=0/1&aphi=<tenths>&aplo=<tenths>`; `loop()` stages the values under the snapshot mutex and queues `CMD_APPLY_AUTOPOWER`, and `bleTask` validates, saves and logs, so the settings variables change in one task only (the same pattern as `CMD_APPLY_THERMOSTAT`). A refused entry shows `Not saved: limits must be 0.1 to 5.0 degrees and the high limit at least 0.1 above the low limit`. The *Heater power* buttons show a line "Automatic" (and are not clickable) while Auto is active; the live block shows the state, for example `Auto: high (shortfall 1.4 °C)`. `SharedState` gets `autoPowerActive`, `autoPower` (the settings) and the shortfall.
+
+**MQTT.** Nothing new is published (H1). The select `dimplex/heater_power/state` follows the read-back as before, so Home Assistant shows what Auto chose; `dimplex/heater_power/set` is ignored and logged while Auto is active.
+
+**Logging (H8).** Tag `power`, short lines (a log line is at most 95 characters):
+- `auto: high, shortfall 1.4 (19.6 / 21)` for every change (temperature / setpoint);
+- `auto: low, no temperature` for H6;
+- `auto settings: on, high 1.1, low 1.0` when saved, and `auto: not active (fireplace thermostat mode)` when Auto is on but the mode has no sensor;
+- `manual power ignored: Auto is on`;
+- `auto: write failed, retry in 30 s`.
+
+**Factory reset** clears the keys with the rest of `cfg`: Auto off, limits 1.1 and 1.0.
+
+**Tests.** `test/thermostat_test.cpp`: `decideAutoPower()` for each row of the table, the exact boundaries (shortfall 1.1 and 1.0), the band with both current powers, negative shortfall, no temperature, and `autoPowerLimitsValid()` (edges 0.1 and 5.0, equal limits, high below low). `test/model_test.cpp` (stubs): Auto in a sensor mode changes the power when the temperature drops and rises, nothing is written while the heater is off, a manual command is ignored while Auto is active and works in the mode *Fireplace thermostat*, the settings survive a restart, a refused entry is not saved, the Settings page is greyed out in the fireplace mode, log lines fit the log ring.
 
 ---
 
@@ -643,6 +680,7 @@ Dimplex Control is meant for a trusted home network. Known limits:
 - **Simulation on a PC.** The sketch is compiled with `g++ -Wall -Wextra` against stub versions of the Arduino, WiFi, WebServer, NimBLE, PubSubClient and related headers, with a simulated fireplace (optionally slow to report changes), a simulated broker and a simulated web client. About 90 checks cover: command execution and ordering, the web pages and live block, button feedback, fireplace selection and validation, factory reset, MQTT discovery and commands, the echo without flicker against a fireplace that needs 1.5 s, the deadband, Bluetooth release and resume, the LED states, a broker that does not answer, a lost BLE link in the middle of a command, and the crash diagnostics (previous session log, restart reason, planned restart, health sensors) and the Wi-Fi watchdog (with shortened delays).
 - **Unit test of the low water detection.** `test/waterwatch_test.cpp` replays the empty-tank test of 10 Nov (on, bounce while putting the mist maker back, off) and tests single odd readings, `0xffff`, start-up and standby: `g++ -std=c++17 -Wall -Wextra -I Dimplex-Control test/waterwatch_test.cpp -o waterwatch_test && ./waterwatch_test`.
 - **Unit test of the weekly program.** `test/schedule_test.cpp` tests `schedule.h` (see section 5.7); `test/program_test.cpp` tests the planner and the page handlers in the sketch with the PC stubs (build line in the file).
+- **Unit test of the automatic heater power.** `test/thermostat_test.cpp` also tests `decideAutoPower()` and the limit validation (section 5.8); `test/model_test.cpp` tests the settings, the ignored manual commands, the page and the switching in the sketch with the PC stubs.
 - **Unit test of the thermostat.** `test/thermostat_test.cpp` tests `thermostat.h` without stubs (hysteresis for both sensors, start rule, fail-safe and recovery, settings validation, parsing of MQTT payloads): `g++ -std=c++17 -Wall -Wextra -I Dimplex-Control test/thermostat_test.cpp -o thermostat_test && ./thermostat_test`.
 - **Measured in the simulation:** the slowest web request stayed in the order of a few milliseconds while BLE and MQTT were blocked.
 - **Not tested:** the real ESP32, the real NimBLE and Wi-Fi coexistence timing, the stack sizes, Home Assistant itself, and long-term behaviour (heap over 24 hours). The first real test of each of those is on the hardware. The Debug page shows the numbers needed (loop gap, request time, free stack, free heap).
