@@ -127,3 +127,39 @@ static inline ThermostatDecision decideThermostat(const ThermostatInput &in) {
   d.heaterOn = heat;
   return d;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// AUTOMATIC HEATER POWER (Auto). Design: docs/design.md section 5.8.
+// With Auto on, the bridge chooses low (0.9 kW) or high (1.8 kW) power from the shortfall = setpoint - temperature.
+// High when the shortfall is at least the high limit, low when it is at most the low limit, in between the power stays as it is
+// (so the power register itself is the memory of the hysteresis). Limits are in tenths of a degree.
+struct AutoPowerSettings { bool enabled; uint8_t highLimit, lowLimit; };
+#define AUTOPOWER_DEFAULT_SETTINGS { false, 11, 10 }
+#define AUTOPOWER_MIN_LIMIT_TENTHS 1        // 0.1 degree
+#define AUTOPOWER_MAX_LIMIT_TENTHS 50       // 5.0 degrees
+
+// Both limits 0.1 to 5.0 degrees and the high limit at least 0.1 above the low limit.
+static inline bool autoPowerLimitsValid(int highTenths, int lowTenths) {
+  return highTenths >= AUTOPOWER_MIN_LIMIT_TENTHS && highTenths <= AUTOPOWER_MAX_LIMIT_TENTHS &&
+         lowTenths >= AUTOPOWER_MIN_LIMIT_TENTHS && lowTenths <= AUTOPOWER_MAX_LIMIT_TENTHS && highTenths >= lowTenths + 1;
+}
+
+enum AutoPowerChoice : uint8_t { AUTOPOWER_KEEP = 0, AUTOPOWER_LOW, AUTOPOWER_HIGH };
+struct AutoPowerInput {
+  bool temperatureFresh;           // a usable temperature (room sensor: recent enough)
+  int temperatureTenths;
+  int setpointDegrees;             // setpoint of the bridge in whole degrees
+  AutoPowerSettings settings;
+};
+struct AutoPowerDecision { AutoPowerChoice choice; int shortfallTenths; };
+
+// No usable temperature: low. Shortfall >= high limit: high. Shortfall <= low limit (also negative): low. Otherwise keep.
+// The caller compares the choice with the power the fireplace has now and only writes when they differ.
+static inline AutoPowerDecision decideAutoPower(const AutoPowerInput &in) {
+  AutoPowerDecision d; d.shortfallTenths = in.setpointDegrees * 10 - in.temperatureTenths;
+  if (!in.temperatureFresh) { d.choice = AUTOPOWER_LOW; d.shortfallTenths = 0; return d; }
+  if (d.shortfallTenths >= in.settings.highLimit)    d.choice = AUTOPOWER_HIGH;
+  else if (d.shortfallTenths <= in.settings.lowLimit) d.choice = AUTOPOWER_LOW;
+  else                                                d.choice = AUTOPOWER_KEEP;
+  return d;
+}

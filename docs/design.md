@@ -30,7 +30,7 @@ Dimplex Control is an ESP32 bridge for a **Dimplex Opti-myst electric fireplace*
 5. Coexist with the original remote: the Bluetooth link can be released on demand.
 6. Be easy to follow and change: one sketch file with clear sections, English names and comments.
 7. Run a **weekly program** in the bridge itself (see "Requirements: weekly program" below and section 5.7).
-8. Choose the heater power automatically from the temperature shortfall (see "Requirements: smart heater power" below; not built yet).
+8. Choose the heater power automatically from the temperature shortfall (see "Requirements: smart heater power" below and section 5.8).
 
 ### Requirements: weekly program
 
@@ -62,7 +62,7 @@ No open points remain for the requirements. Details of the design (storage forma
 
 ### Requirements: smart heater power (Auto)
 
-Status: **requirements agreed and designed (section 5.8), not built yet.** Idea of the owner: the fireplace can heat at low (0.9 kW) or high (1.8 kW) power. When the room is far below the setpoint it should heat at high power, and when it is close to the setpoint low power is enough. The temperature reacts slowly, so a small band between the two limits is enough. The requirements below were agreed with the owner.
+Status: **built (section 5.8); tested on a PC only, not yet on the fireplace.** Idea of the owner: the fireplace can heat at low (0.9 kW) or high (1.8 kW) power. When the room is far below the setpoint it should heat at high power, and when it is close to the setpoint low power is enough. The temperature reacts slowly, so a small band between the two limits is enough. The requirements below were agreed with the owner.
 
 | # | Requirement |
 |---|---|
@@ -514,7 +514,7 @@ There is no minimum time between changes (H5). Switching Auto on with the shortf
 
 **Manual commands (H7).** `CMD_HEATER_POWER` (web page, MQTT select, anything else) is refused in `bleTask` while Auto is active: no write, message `Heater power is automatic (Auto is on)` on the web page and a log line. When Auto is not active (off, or mode *Fireplace thermostat*) it works as before. Switching Auto off changes nothing on the fireplace.
 
-**Web.** The **Settings** page gets, in the *Temperature control* block, a small form: a checkbox *Auto heater power*, the two limit fields (step 0.1, 0.1 to 5.0) and Save. In the mode *Fireplace thermostat* the form is greyed out (disabled inputs) with the text "Needs a temperature sensor mode". The form posts `/set?apon=0/1&aphi=<tenths>&aplo=<tenths>`; `loop()` stages the values under the snapshot mutex and queues `CMD_APPLY_AUTOPOWER`, and `bleTask` validates, saves and logs, so the settings variables change in one task only (the same pattern as `CMD_APPLY_THERMOSTAT`). A refused entry shows `Not saved: limits must be 0.1 to 5.0 degrees and the high limit at least 0.1 above the low limit`. The *Heater power* buttons show a line "Automatic" (and are not clickable) while Auto is active; the live block shows the state, for example `Auto: high (shortfall 1.4 °C)`. `SharedState` gets `autoPowerActive`, `autoPower` (the settings) and the shortfall.
+**Web.** The **Settings** page gets, in the *Temperature control* block, a small form: a checkbox *Auto heater power*, the two limit fields (step 0.1, 0.1 to 5.0) and Save. In the mode *Fireplace thermostat* the form is greyed out (disabled inputs) with the text "Needs a temperature sensor mode". The form posts `/set?apon=0/1&aphi=<tenths>&aplo=<tenths>`; `loop()` stages the values under the snapshot mutex and queues `CMD_APPLY_AUTOPOWER`, and `bleTask` validates, saves and logs, so the settings variables change in one task only (the same pattern as `CMD_APPLY_THERMOSTAT`). A refused entry shows `Not saved: limits 0.1-5.0 degrees, high at least 0.1 above low`. The *Heater power* buttons show a line "Automatic" (and are not clickable) while Auto is active; the live block shows the state, for example `Auto: high (shortfall 1.4 °C)`. `SharedState` gets `autoPowerActive`, `autoPower` (the settings) and the shortfall.
 
 **MQTT.** Nothing new is published (H1). The select `dimplex/heater_power/state` follows the read-back as before, so Home Assistant shows what Auto chose; `dimplex/heater_power/set` is ignored and logged while Auto is active.
 
@@ -526,6 +526,8 @@ There is no minimum time between changes (H5). Switching Auto on with the shortf
 - `auto: write failed, retry in 30 s`.
 
 **Factory reset** clears the keys with the rest of `cfg`: Auto off, limits 1.1 and 1.0.
+
+**Not covered by the PC test:** the room-sensor case "no temperature while the element still runs" (H6) is only tested in `decideAutoPower()`, because the fail-safe switches the element off in the same round.
 
 **Tests.** `test/thermostat_test.cpp`: `decideAutoPower()` for each row of the table, the exact boundaries (shortfall 1.1 and 1.0), the band with both current powers, negative shortfall, no temperature, and `autoPowerLimitsValid()` (edges 0.1 and 5.0, equal limits, high below low). `test/model_test.cpp` (stubs): Auto in a sensor mode changes the power when the temperature drops and rises, nothing is written while the heater is off, a manual command is ignored while Auto is active and works in the mode *Fireplace thermostat*, the settings survive a restart, a refused entry is not saved, the Settings page is greyed out in the fireplace mode, log lines fit the log ring.
 

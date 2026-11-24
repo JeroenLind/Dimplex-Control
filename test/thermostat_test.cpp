@@ -56,6 +56,20 @@ int main() {
   CHECK(!parseTemperatureTenths("nan", t));
   CHECK(!parseTemperatureTenths("999", t));
 
+  // --- automatic heater power ---
+  { AutoPowerSettings st = AUTOPOWER_DEFAULT_SETTINGS; CHECK(!st.enabled && st.highLimit == 11 && st.lowLimit == 10);
+    auto dec = [&](int tenths, bool fresh = true, int high = 11, int low = 10) { AutoPowerInput in = { fresh, tenths, 21, { true, (uint8_t) high, (uint8_t) low } }; return decideAutoPower(in); };
+    CHECK(dec(199).choice == AUTOPOWER_HIGH && dec(199).shortfallTenths == 11);                 // shortfall 1.1: high (boundary)
+    CHECK(dec(200).choice == AUTOPOWER_LOW && dec(200).shortfallTenths == 10);                  // 1.0: low (boundary)
+    CHECK(dec(150).choice == AUTOPOWER_HIGH && dec(190).choice == AUTOPOWER_HIGH);
+    CHECK(dec(210).choice == AUTOPOWER_LOW && dec(230).choice == AUTOPOWER_LOW && dec(230).shortfallTenths == -20);   // at and above the setpoint
+    CHECK(dec(100, false).choice == AUTOPOWER_LOW);                                             // no temperature: low
+    CHECK(dec(195, true, 15, 5).choice == AUTOPOWER_HIGH && dec(196, true, 15, 5).choice == AUTOPOWER_KEEP);   // wide band 0.5 to 1.5: shortfall 1.5 high, 1.4 keep
+    CHECK(dec(204, true, 15, 5).choice == AUTOPOWER_KEEP && dec(205, true, 15, 5).choice == AUTOPOWER_LOW);    // shortfall 0.6 keep, 0.5 low
+    CHECK(autoPowerLimitsValid(11, 10) && autoPowerLimitsValid(50, 1) && autoPowerLimitsValid(2, 1));
+    CHECK(!autoPowerLimitsValid(10, 10) && !autoPowerLimitsValid(9, 10) && !autoPowerLimitsValid(51, 10) && !autoPowerLimitsValid(11, 0) && !autoPowerLimitsValid(0, 0) && !autoPowerLimitsValid(1, 1));
+  }
+
   printf("%d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
 }
