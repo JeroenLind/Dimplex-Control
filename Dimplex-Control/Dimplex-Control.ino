@@ -44,7 +44,7 @@
  */
 // Workaround for Arduino-ESP32 core 4.0: the core releases the BLE memory at boot unless a BLE library has registered
 // through this header (NimBLE-Arduino issue 1199; fixed in NimBLE-Arduino master but not yet in a release). The header
-// does not exist in older cores, so it is only included when present. EXPERIMENT: not in main, see docs/design.md.
+// does not exist in older cores, so it is only included when present (see docs/design.md, known incompatibility).
 #if defined(__has_include)
 #if __has_include(<esp32-hal-alloc-ble-mem.h>)
 #include <esp32-hal-alloc-ble-mem.h>
