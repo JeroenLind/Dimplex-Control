@@ -54,6 +54,7 @@
 
 #include <WiFi.h>
 #include <time.h>
+#include <esp_sntp.h>      // sntp_set_time_sync_notification_cb(): moment of the last NTP sync
 #include <ESPmDNS.h>
 #include <WiFiManager.h>
 #include <Preferences.h>
@@ -1821,6 +1822,9 @@ static void setProgramOn(bool on) {
   g_programOn = on; saveProgramOn();
   logLine("program", "program %s", on ? "on" : "off");
 }
+// Moment of the last NTP sync (epoch seconds, 0 = none yet), set by the SNTP callback for the clock line on the Program page.
+static volatile time_t g_lastNtpSync = 0;
+static void ntpSynced(struct timeval *tv) { g_lastNtpSync = tv->tv_sec; }
 // Local time as minute key and weekday (0 = Monday); false while NTP has not synced.
 static bool localMinuteKey(uint32_t &key, int &weekday) {
   struct tm t; if (!getLocalTime(&t, 0)) return false;
@@ -2193,8 +2197,19 @@ static String buildDebugLive(const SharedState &s, uint32_t pending) {
 }
 
 // Live block of the Program page: only what changes by itself (time known, what the program is doing now).
+// The clock the bridge works with (the weekly program runs on it), with the NTP status.
+static String bridgeClockLine() {
+  static const char *dayNames[7] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+  struct tm t; char text[48];
+  if (!getLocalTime(&t, 0)) return "<p><b>Bridge time:</b> not known yet &middot; NTP: not synchronized yet</p>";
+  snprintf(text, sizeof(text), "%s %04d-%02d-%02d %02d:%02d:%02d", dayNames[t.tm_wday], t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+  String h = String("<p><b>Bridge time:</b> ") + text + " &middot; NTP: synchronized";
+  time_t last = g_lastNtpSync;
+  if (last) { struct tm l; localtime_r(&last, &l); snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d:%02d", l.tm_year + 1900, l.tm_mon + 1, l.tm_mday, l.tm_hour, l.tm_min, l.tm_sec); h += String(", last sync ") + text; }
+  return h + "</p>";
+}
 static String buildProgramLive() {
-  String h;
+  String h = bridgeClockLine();
   if (!g_timeKnown) h += "<p class=msg>The time is not known yet (no NTP). The program does not run until it is; you can already edit the list.</p>";
   if (g_programOn && g_programPending.action != SCHED_NONE)
     h += String("<p class=dim>Busy: switching ") + (g_programPending.action == SCHED_ON ? "on" : "off") + ", trying until the fireplace follows (max 5 minutes).</p>";
@@ -2687,6 +2702,7 @@ void loop() {
   checkWifiConnection();
   if (WiFi.status() == WL_CONNECTED) {
     if (!g_ntpStarted) {            // time zone from the Settings page (default: Dutch time incl. summer time)
+      sntp_set_time_sync_notification_cb(ntpSynced);
       configTzTime(g_timeZone, "pool.ntp.org", "time.google.com");
       g_ntpStarted = true;
     }

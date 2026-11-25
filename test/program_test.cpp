@@ -41,6 +41,11 @@ int main() {
   handleSettingsPage(); CK(g_webServer.lastBody.find("Time zone") != std::string::npos);
   // delete
   g_webServer.args = {{"del","0"}}; handleProgramSet(); CK(g_ruleCount == 0);
+  // clock line on the Program page: weekday, date, time and the NTP status
+  { handleProgramPage(); struct tm t; getLocalTime(&t, 0); char want[40]; strftime(want, sizeof(want), "%A %Y-%m-%d %H:%M:%S", &t);
+    CK(g_webServer.lastBody.find(std::string("<b>Bridge time:</b> ") + want + " &middot; NTP: synchronized") != std::string::npos);
+    g_lastNtpSync = 1790000000; handleProgramPage(); char sync[40]; time_t e = 1790000000; struct tm l; localtime_r(&e, &l); strftime(sync, sizeof(sync), ", last sync %Y-%m-%d %H:%M:%S", &l);
+    CK(g_webServer.lastBody.find(sync) != std::string::npos); g_lastNtpSync = 0; }
   // off-only rule: no on time, form field left empty. Overlap with another rule is refused, "already off" does nothing.
   { uint32_t k; int w; localMinuteKey(k, w); int t0 = (int)(k % 1440) + 2; char offA[8], insideT[8], dayA[3] = { 'd', (char)('0' + w), 0 };
     snprintf(offA, 8, "%02d:%02d", t0 / 60 % 24, t0 % 60); snprintf(insideT, 8, "%02d:%02d", (t0 + 1) / 60 % 24, (t0 + 1) % 60);
