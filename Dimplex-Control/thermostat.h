@@ -105,6 +105,17 @@ struct ThermostatDecision {
   int offAboveTenths, onBelowTenths;   // the two switching points that apply (for display)
 };
 
+// In the bridge modes the fireplace gets its own setpoint this many degrees above the bridge's setpoint. The fireplace's
+// thermostat also switches the element (it follows the warm sensor inside the fireplace): with the same value as the bridge
+// it cut out long before the room was warm (docs/experiments.md section 11). A margin keeps it as a back-up.
+#define FIREPLACE_BACKUP_OFFSET_DEGREES 2
+
+// The setpoint to write to the fireplace: bridge setpoint + offset, within the limits of the fireplace.
+static inline int fireplaceBackupSetpoint(int bridgeDegrees, int minDegrees, int maxDegrees) {
+  int degrees = bridgeDegrees + FIREPLACE_BACKUP_OFFSET_DEGREES;
+  return degrees < minDegrees ? minDegrees : (degrees > maxDegrees ? maxDegrees : degrees);
+}
+
 // The hysteresis, in one place.
 //   - No usable temperature: the heater must be off (fail-safe). Only the room sensor gets here; the caller does not ask
 //     when the internal sensor could not be read for a moment.

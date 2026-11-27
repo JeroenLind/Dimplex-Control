@@ -43,6 +43,12 @@ int main() {
   CHECK(!thermostatSettingsValid(3, 3, 10, 2, 0));      // time-out too short
   CHECK(!thermostatSettingsValid(3, 3, 10, 2, 241));    // time-out too long
 
+  // --- setpoint written to the fireplace: bridge setpoint + 2, within the fireplace's limits ---
+  CHECK(fireplaceBackupSetpoint(18, 15, 30) == 20);
+  CHECK(fireplaceBackupSetpoint(28, 15, 30) == 30);
+  CHECK(fireplaceBackupSetpoint(30, 15, 30) == 30);   // clamped to the maximum
+  CHECK(fireplaceBackupSetpoint(10, 15, 30) == 15);   // clamped to the minimum
+
   // --- parsing of MQTT payloads ---
   int t = 0;
   CHECK(parseTemperatureTenths("21.3", t) && t == 213);
