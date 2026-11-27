@@ -1033,17 +1033,20 @@ static bool bleSwitchHeaterPhysical(bool on) {
 
 // With bridge control the fireplace's own thermostat keeps running as a back-up (if the bridge fails, the fireplace still
 // regulates). The fireplace starts at 21 degrees every time the heater is switched on, so after a start the bridge setpoint is
-// written to it. Quiet (no message on the page); tries again at most every 15 s when the write is not confirmed.
+// written to it, plus FIREPLACE_BACKUP_OFFSET_DEGREES (thermostat.h): with the same value the fireplace's thermostat
+// cuts out long before the room is warm. Quiet (no message on the page); tries again at most every 15 s when the write is not confirmed.
 static void syncFireplaceSetpoint() {
-  if (!heaterIsOn() || !g_chSetpoint || g_setpoint == g_bridgeSetpoint) return;
+  if (!heaterIsOn() || !g_chSetpoint) return;
+  int target = fireplaceBackupSetpoint(g_bridgeSetpoint, g_setpointMin, g_setpointMax);
+  if (g_setpoint == target) return;
   if (g_setpointSyncRetryAtMs != 0 && (int32_t)(g_setpointSyncRetryAtMs - millis()) > 0) return;
   g_setpointSyncRetryAtMs = millis() + 15000;
-  uint8_t bytes[2] = {(uint8_t)(g_bridgeSetpoint & 0xff), (uint8_t)(g_bridgeSetpoint >> 8)};
+  uint8_t bytes[2] = {(uint8_t)(target & 0xff), (uint8_t)(target >> 8)};
   writeRegister(g_chSetpoint, bytes, 2);
-  logLine("thermo", "fireplace setpoint %d -> %d C (back-up thermostat)", g_setpoint, g_bridgeSetpoint);
-  g_awaitedSetpoint = g_bridgeSetpoint;
+  logLine("thermo", "fireplace setpoint %d -> %d C (back-up thermostat, bridge %d)", g_setpoint, target, g_bridgeSetpoint);
+  g_awaitedSetpoint = target;
   readUntil([] { return g_setpoint == g_awaitedSetpoint; }, 3000, "setpoint sync");
-  if (g_setpoint == g_bridgeSetpoint) g_setpointSyncRetryAtMs = 0;
+  if (g_setpoint == target) g_setpointSyncRetryAtMs = 0;
 }
 
 // The thermostat of the bridge (modes "room sensor" and "internal sensor"). Called about once a second by bleTask while the
@@ -1170,7 +1173,7 @@ static bool bleSetFireplaceSetpoint(int degrees) {
   return true;
 }
 // Setpoint of the bridge's own control: saved in flash, works with the heater off and without a Bluetooth link. The thermostat
-// applies it at once and the fireplace gets the same value as back-up setpoint (syncFireplaceSetpoint).
+// applies it at once and the fireplace gets this value + 2 as back-up setpoint (syncFireplaceSetpoint).
 static bool bleSetBridgeSetpoint(int degrees) {
   if (degrees < g_setpointMin) degrees = g_setpointMin;
   if (degrees > g_setpointMax) degrees = g_setpointMax;
@@ -2060,7 +2063,7 @@ static String buildMainLive(const SharedState &s) {
     h += linkButton("&minus;1", setHref("spd=-1"), false) + "<b class='big" + String(g_awaited[AW_SETPOINT].active ? " pending" : "") + "'>" + String(g_awaited[AW_SETPOINT].active ? g_awaited[AW_SETPOINT].target : shown) + "&deg;C</b> " + linkButton("+1", setHref("spd=1"), false);
     h += "<form action='/set' style='margin-top:6px'>Set: <input type=number name=sp min=" + String(s.setpointMin) + " max=" + String(s.setpointMax) +
          " value=" + String(shown) + "> <button class=b>Apply</button> <span class=dim>(" + String(s.setpointMin) + "&ndash;" + String(s.setpointMax) + ")</span></form>";
-    if (bridgeControl) h += "<p class=dim>Setpoint of the bridge's control. It is saved in the bridge and also sent to the fireplace as back-up thermostat.</p>";
+    if (bridgeControl) h += "<p class=dim>Setpoint of the bridge's control. It is saved in the bridge and the fireplace gets this value + " + String(FIREPLACE_BACKUP_OFFSET_DEGREES) + " &deg;C as back-up thermostat.</p>";
   } else h += "<p class=dim>Only available while the heater is on (the fireplace starts at 21&deg;C).</p>";
 
   if (s.controlMode == CONTROL_EXTERNAL) {

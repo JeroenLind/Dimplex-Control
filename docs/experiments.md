@@ -2,7 +2,7 @@
 
 This file describes **how** the registers were deciphered: which dumps, which comparisons and which measurements. The result (what each register does) is in `register-map.md`.
 
-Status: 20 October 2026, based on register dumps 01 to 16 (14 and 15 Oct), the sniffs of the remote (13 and 17 Oct) and the bridge's status log (17 Oct). Dump file names are in Dutch as originally created (`Referentie` = reference, `HaardLichtAan` = fireplace light on, `HeaterAan` = heater on, `HoogVermogen` = high power).
+Status: 27 November 2026 (section 11); sections 1 to 7: based on register dumps 01 to 16 (14 and 15 Oct), the sniffs of the remote (13 and 17 Oct) and the bridge's status log (17 Oct). Dump file names are in Dutch as originally created (`Referentie` = reference, `HaardLichtAan` = fireplace light on, `HeaterAan` = heater on, `HoogVermogen` = high power).
 
 ## 1. Sources and caveats
 
@@ -256,7 +256,7 @@ Source: a Home Assistant history export (times below are local time, UTC+2). Ent
 
 - Heater started at 19:02:46 with the setpoint at 21 °C (the fireplace's default; the setpoint entity still showed 19 from the previous session until the heater started).
 - The internal sensor (0x0055) rose from 18.3 °C to 22.2 °C in 11.5 minutes while the power stayed at about 990 W the whole time. It passed the setpoint of 21 °C at about 19:08 (a quarter of the time in) and was 1.2 °C above it when the heater was switched off by hand at 19:14:23: **the heating element did not switch off when 0x0055 exceeded the setpoint.**
-- The room thermometer stayed at 18.2-18.4 °C during the whole session. So the fireplace probably regulates on a different sensor than 0x0055 (for example a sensor in the air inlet, which sees room air), and 0x0055 is a sensor in or near the warm air stream. This is a conclusion from one run; a run with a setpoint below the room temperature would confirm it.
+- The room thermometer stayed at 18.2-18.4 °C during the whole session. So the fireplace probably regulates on a different sensor than 0x0055 (but see section 11) (for example a sensor in the air inlet, which sees room air), and 0x0055 is a sensor in or near the warm air stream. This is a conclusion from one run; a run with a setpoint below the room temperature would confirm it.
 - After the heater was switched off, 0x0055 kept rising from 22.2 to 23.0 °C within 2 minutes (still rising), as seen before.
 - With the effect on and the heater off, 0x0055 sat at 17.6-18.0 °C, about 0.5 °C below the room thermometer (the mist cools the sensor).
 - Initial heating slope here was about 0.5 °C/min, half of what was seen on 17 Oct (about 1.0 °C/min); the cause is unknown.
@@ -267,3 +267,32 @@ Source: a Home Assistant history export (times below are local time, UTC+2). Ent
 - Readings arrive in Home Assistant about every 5 s while the temperature changes, which matches the 5 s poll interval.
 - After the bridge restarted (about 18:51), Home Assistant showed the old retained value (20.9 °C) for about 30 s; the first real reading after the Bluetooth link came up was 17.9 °C. State topics are retained, so stale values are shown while the fireplace link is down.
 - At 18:54:23 the fireplace switch went on (the meter showed 154 W 2 s later), went off at 18:54:38 (meter 0 W 1.3 s later, so the fireplace **really** switched off) and went on again at 18:55:43. This is the "on, off, on" the owner noticed. Because the power really dropped, this was not only a display glitch caused by a late read-back; what sent the off command at 18:54:38 was not established (check the Home Assistant logbook for the context of that state change and the bridge's serial log).
+
+## 11. Heater cycling while the room is cold, 27 Nov (Home Assistant history)
+
+Source: history export, local time (UTC+1). Mode *Room sensor (MQTT)*, bridge setpoint 18 °C (written unchanged to the fireplace by the firmware of that day), room 16.0-16.2 °C, power mostly high.
+
+**Observed**
+
+- From 11:59:55 the bridge reported `heating` and element `on` (except a manual off/on at 12:40), but the power meter fell from about 1780 W to 166 W (effect only) again and again. So something other than the bridge switched the element.
+- The switching follows the internal sensor (`0x0055`): off at about 25 °C, on again at about 24.3 °C.
+
+| Element on (meter) | Element off (meter) | Duration |
+|---|---|---|
+| 11:59:55 | 12:04:51 | about 5 min (warming up from 15.5 °C) |
+| 12:15:47 | 12:18:18 | 2.5 min |
+| 12:31:25 | 12:33:56 | 2.5 min |
+| 12:40:17 | 12:40:23 | 6 s |
+| 12:48:16 | 12:50:52 | 2.6 min |
+| 13:04:13 | 13:05:59 | 1.8 min |
+
+- Between 12:05 and 13:09 the element was on for only about 15 % of the time.
+- 12:40: heating was switched off and on again. The fireplace then starts at 21 °C, and the element came on although `0x0055` read 25.8 °C. Six seconds later it was off again, which fits the bridge writing 18 back (that write is not visible in the history: the setpoint entity shows the bridge setpoint).
+
+**Conclusion** (inferred, not tested separately): the fireplace's own thermostat cut the element, because it had the same setpoint as the bridge while its sensor reads far above room temperature. This replaces the guess in section 8 that it regulates on a sensor that sees room air: the run of 19 Oct (setpoint 21, `0x0055` up to 22.2 without cutting out) does not contradict a cut-out point some degrees above the setpoint.
+
+**Change:** the bridge now writes its setpoint + 2 °C to the fireplace.
+
+**To check:** a run with setpoint 18 (fireplace 20) with the power meter. At which `0x0055` does the element cut out now, and what share of the time is it on? The relation between the fireplace setpoint and the cut-out temperature is not known, so 2 °C may turn out to be too little.
+
+Separate from this: *Low water* was on from 12:43:06 to 12:45:02.

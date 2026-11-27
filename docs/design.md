@@ -446,7 +446,7 @@ Issue #1: the fireplace's own thermostat kept the element running above the setp
 
 **Taking over.** A heater found running without a wish (started with the remote, or after a bridge restart) is taken over by the control. The fireplace is switched off, or the Bluetooth link released: the wish is cleared.
 
-**Setpoint.** In a bridge mode the setpoint is the bridge's own (`bsetp`, flash). It is also written to the fireplace after the heater has started (the fireplace starts at 21 every time), so the fireplace's own thermostat acts as a back-up if the bridge fails. A write that is not confirmed is tried again after 15 s. `dimplex/setpoint/state` then always shows the bridge setpoint.
+**Setpoint.** In a bridge mode the setpoint is the bridge's own (`bsetp`, flash). After the heater has started (the fireplace starts at 21 every time) the fireplace gets this value + `FIREPLACE_BACKUP_OFFSET_DEGREES` (2 °C), clamped to its limits (`fireplaceBackupSetpoint()` in `thermostat.h`), so its own thermostat acts as a back-up if the bridge fails. With the same value as the bridge it switched the element off far below the room setpoint (experiments.md section 11). 2 °C is a chosen balance between cutting out too early and never cutting out; whether it is enough has not been measured yet. After a switch to the mode *Fireplace thermostat* the raised value stays in the fireplace until it is changed or the heater restarts. A write that is not confirmed is tried again after 15 s. `dimplex/setpoint/state` then always shows the bridge setpoint.
 
 **Switching the element.** A failed or unconfirmed switch is retried after 30 s, not every second.
 
@@ -633,6 +633,7 @@ A confirmation page, then the BLE task releases the link, clears the `cfg` names
 | Timestamps through one helper | A mix of timestamped and plain lines made the log hard to read. |
 | Settings in NVS, set up through a captive portal | No credentials in the source needed for normal use, and no re-flash to change the broker or fireplace. |
 | Thermostat in the bridge, in `bleTask` | The fireplace's own thermostat is unreliable. The bridge already owns the BLE link, so the control needs no new task and no new locking. |
+| Fireplace setpoint = bridge setpoint + 2 °C | Both thermostats can switch the element. Equal values made the fireplace cut out first (experiments.md section 11); no limit at all (30 °C) would leave almost no back-up. |
 | Decision logic in `thermostat.h` | It has no hardware calls, so the hysteresis and the fail-safe are tested on a PC. |
 | Web Heating On starts the flame effect first | One press starts the heating. The web page sends `CMD_HEATER` with argument 2 (on, flame effect first); `bleSetHeater()` then switches the effect on, waits for the fireplace to confirm it and continues. The separate Flame effect and Heating buttons stay for doing it step by step. MQTT keeps the old rule so an automation never turns the flame on by surprise. |
 | Same raw registers in all three places | The raw MQTT sensor, the Debug page and the CSV log only show registers that are not understood yet: `0x003c`, `0x0063`, and `0x0051`, `0x0026`, `0x0036`, `0x0024`, which are only watched (for example to compare `0x0051` with a power meter). Registers that are understood have their own entity or column (the CSV keeps the decoded columns: temperature, effect, heater, power, setpoint, flame level). A CSV row is also written when `0x0063`, `0x0051`, `0x0026`, `0x0036` or `0x0024` changes, or `0x003c` crosses the wet/dry limit, so an empty tank and every flip of the watched registers are visible in the log. |
@@ -694,7 +695,8 @@ Dimplex Control is meant for a trusted home network. Known limits:
 
 | Topic | Notes |
 |---|---|
-| Thermostat behaviour | Issue #1 addresses this with the temperature control in the bridge (section 5.5). In one measured run the heating element kept running while the internal sensor (`0x0055`) was 1.2 °C above the setpoint. The fireplace probably regulates on a different sensor. See `experiments.md`. The bridge shows `0x0055` as "internal temperature", not as room temperature. |
+| Back-up thermostat of the fireplace | It can still switch the element off before the room is warm, because the offset of 2 °C has not been verified with a measurement (experiments.md section 11). |
+| Thermostat behaviour | Issue #1 addresses this with the temperature control in the bridge (section 5.5). In one measured run the heating element kept running while the internal sensor (`0x0055`) was 1.2 °C above the setpoint. The history of 27 Nov indicates that the fireplace does regulate on a warm internal reading, with a cut-out some degrees above its setpoint (`experiments.md` section 11). The bridge shows `0x0055` as "internal temperature", not as room temperature. |
 | Radio sharing | Wi-Fi and Bluetooth share the radio on the ESP32. While the bridge scans or connects, web responses can be slower by tens to hundreds of milliseconds. |
 | Time zone | Chosen on the Settings page (list or TZ string); applies to the program and the fireplace clock. At the first start it is Central European Time. |
 | Single fireplace | One address, one BLE link. |
