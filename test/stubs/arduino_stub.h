@@ -190,6 +190,7 @@ struct WebServer {
   void on(const char *, void (*)()) {} void begin() {} void stop() {} void handleClient() {}
   bool hasArg(const char *k) { return args.count(k) > 0; }
   String arg(const char *k) { return args.count(k) ? String(args[k]) : String(); }
+  String uri() { return String(); }
   void sendHeader(const char *n, const char *v) { if (!strcmp(n, "Location")) lastLocation = v; }
   void send(int code, const char *, const String &body) { lastCode = code; lastBody = body.s; }
   void send(int code, const char *, const char *body) { lastCode = code; lastBody = body; }
