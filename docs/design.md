@@ -224,7 +224,7 @@ Served by the Arduino `WebServer` on port 80 from `loop()`.
 | `/manifest.webmanifest`, `/sw.js`, `/icon-192.png`, `/icon-512.png` | Web app manifest, service worker and icons, so the page can be installed as an app (below) |
 | `/log` | The restart-proof log as text: the previous session (with its last steps) and the latest lines of this one |
 
-Every page is a fixed frame around one live block. A small script fetches `/live?p=<page>` every 3 s (every 1 s while commands are running or the link is connecting) and replaces the block. Forms sit outside the live block, so a refresh never clears what is being typed. Without JavaScript the page refreshes itself every 5 s.
+Every page is a fixed frame around one live block. A small script fetches `/live?p=<page>` every 3 s (every 1 s while commands are running or the link is connecting) and replaces the block. Forms sit outside the live block, so a refresh never clears what is being typed. A fetch without an answer after 6 s (`PAGE_FETCH_TIMEOUT_MS`) is aborted, and after a failed fetch the script tries again 1 s later, so one stalled request does not leave an old "Working" block on the screen. Without JavaScript the page refreshes itself every 5 s.
 
 **Slow requests.** The web server handles one request at a time. A `handleClient()` call of 1 s or longer (`SLOW_WEB_REQUEST_US`) is written to the log with its duration, the last URI, the free heap and the Wi-Fi signal. The URI is the last one the server parsed, so for a connection that stalls before sending its request it can name the previous page.
 

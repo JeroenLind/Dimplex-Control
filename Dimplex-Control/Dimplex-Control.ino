@@ -112,6 +112,7 @@ static char cfg_mqttPassword[40] = "dimplex";
 #define SLOW_WEB_REQUEST_US     1000000UL     // a web request that takes this long is written to the log
 #define PAGE_REFRESH_MS              3000     // live block refresh interval
 #define PAGE_REFRESH_BUSY_MS         1000     // ... while commands are running or the link is connecting
+#define PAGE_FETCH_TIMEOUT_MS      6000     // a live block request without an answer after this long is given up and repeated
 // Wi-Fi watchdog (see checkWifiConnection): what to do when the Wi-Fi connection stays away
 #ifndef WIFI_RECONNECT_AFTER_MS
 #define WIFI_RECONNECT_AFTER_MS      30000    // Wi-Fi down this long: ask for a new connection, then again every 30 s
@@ -2264,10 +2265,11 @@ static void sendPage(const char *page, const String &afterLive) {
              "<h2>&#128293; Dimplex Control</h2><nav>" + navLink(PAGE_MAIN, "/", "Main") + navLink(PAGE_PROGRAM, "/program", "Program") + navLink(PAGE_SETTINGS, "/settings", "Settings") + navLink(PAGE_DEBUG, "/debug", "Debug") +
              "</nav><div id=live>" + live + "</div>" + afterLive;
   h += String("<script>var box=document.getElementById('live');"
-              "function tick(){fetch('/live?p=") + page + "',{cache:'no-store'}).then(function(r){return r.text()}).then(function(t){"
+              "function tick(){var c=window.AbortController?new AbortController():null,k=c&&setTimeout(function(){c.abort()}," + String(PAGE_FETCH_TIMEOUT_MS) + ");"
+       "fetch('/live?p=") + page + "',{cache:'no-store',signal:c?c.signal:undefined}).then(function(r){return r.text()}).then(function(t){clearTimeout(k);"
        "var a=document.activeElement;if(!(a&&a.tagName=='INPUT'))box.innerHTML=t;"
        "setTimeout(tick,t.indexOf('data-busy')>=0?" + String(PAGE_REFRESH_BUSY_MS) + ":" + String(PAGE_REFRESH_MS) + ");"
-       "}).catch(function(){setTimeout(tick,5000)});}"
+       "}).catch(function(){clearTimeout(k);setTimeout(tick,1000)});}"
        "setTimeout(tick," + String(PAGE_REFRESH_MS) + ");"
        "if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(function(){});</script></body></html>";
   g_webServer.send(200, "text/html", h);
