@@ -109,6 +109,7 @@ static char cfg_mqttPassword[40] = "dimplex";
 #define THERMOSTAT_INTERVAL_MS       1000     // how often bleTask runs the thermostat of the bridge (decision only; it switches when needed)
 #define BLE_RETRY_INTERVAL_MS        5000     // pause between BLE connect attempts
 #define MESSAGE_SHOW_TIME_MS         8000     // how long a result message stays on the web page
+#define SLOW_WEB_REQUEST_US     1000000UL     // a web request that takes this long is written to the log
 #define PAGE_REFRESH_MS              3000     // live block refresh interval
 #define PAGE_REFRESH_BUSY_MS         1000     // ... while commands are running or the link is connecting
 // Wi-Fi watchdog (see checkWifiConnection): what to do when the Wi-Fi connection stays away
@@ -2721,6 +2722,10 @@ void loop() {
     g_webServer.handleClient();
     uint32_t durationUs = micros() - startUs;
     if (durationUs > g_webRequestMaxUs) g_webRequestMaxUs = durationUs;
+    // A slow call blocks every other page request: keep what is known about it in the log (/log).
+    if (durationUs >= SLOW_WEB_REQUEST_US)
+      logLine("web", "slow request: %lu ms, last uri %s, free heap %lu, rssi %d", (unsigned long)(durationUs / 1000),
+              g_webServer.uri().c_str(), (unsigned long) ESP.getFreeHeap(), (int) WiFi.RSSI());
   }
   delay(1);                          // everything else runs in bleTask, mqttTask and ledTask
 }
